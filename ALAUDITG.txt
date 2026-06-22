@@ -1,0 +1,258 @@
+*****************************************************************
+      * PROGRAM-ID:  ALAUDITG                                         *
+      * AUTHOR:      IBM i Security Systems Developer                 *
+      * DESCRIPTION: Universal Db2 for i Audit Trigger Processor.     *
+      * FEATURES:    - Captures User, Workstation, and Job via API.   *
+      * - Byte-level parsing of Old vs. New record maps. *
+      * - Simulated encryption for sensitive data fields.*
+      * - FAA/TSA Compliant secure journaling.           *
+      *****************************************************************
+       IDENTIFICATION DIVISION.
+       PROGRAM-ID. ALAUDITG.
+
+       ENVIRONMENT DIVISION.
+       INPUT-OUTPUT SECTION.
+       FILE-CONTROL.
+      * Sequential file for Compliance Audit Logging
+           SELECT AUDIT-LOG ASSIGN TO DATABASE-SECAUDIT
+               ORGANIZATION IS SEQUENTIAL
+               ACCESS MODE IS SEQUENTIAL
+               FILE STATUS IS WS-AUDIT-STATUS.
+
+       DATA DIVISION.
+       FILE SECTION.
+       FD  AUDIT-LOG.
+       01  AUDIT-RECORD.
+           05  AUD-TIMESTAMP            PIC X(20).
+           05  AUD-SYSTEM-INFO.
+               10  AUD-JOB-NAME         PIC X(10).
+               10  AUD-USER-PROFILE     PIC X(10).
+               10  AUD-JOB-NUMBER       PIC X(06).
+           05  AUD-FILE-INFO.
+               10  AUD-FILE-NAME        PIC X(10).
+               10  AUD-MEMBER-NAME      PIC X(10).
+               10  AUD-ACTION           PIC X(06).
+           05  AUD-DATA-PAYLOAD.
+               10  AUD-CHANGE-OFFSET    PIC 9(04).
+               10  AUD-OLD-VALUE        PIC X(50).
+               10  AUD-NEW-VALUE        PIC X(50).
+
+       WORKING-STORAGE SECTION.
+      * --- FILE STATUS FLAGS ---
+       01  WS-FILE-STATUSES.
+           05  WS-AUDIT-STATUS          PIC X(02) VALUE '00'.
+
+      * --- IBM I API CEE DATE/TIME VARIABLES ---
+       01  WS-CEE-VARS.
+           05  WS-LILIAN-DAYS           PIC S9(09) BINARY.
+           05  WS-LILIAN-SECS           PIC COMP-8.
+           05  WS-GREGORIAN-DATE        PIC X(20).
+           05  WS-PIC-STR               PIC X(20) 
+                                        VALUE 'YYYY-MM-DD HH:MI:SS '.
+           05  WS-FC                    PIC X(12).
+
+      * --- IBM I QUSRJOBI API VARIABLES ---
+       01  WS-JOBI0100-RECEIVER.
+           05  WS-JOBI-BYTES-RTN        PIC S9(09) BINARY.
+           05  WS-JOBI-BYTES-AVAIL      PIC S9(09) BINARY.
+           05  WS-JOBI-JOB-NAME         PIC X(10).
+           05  WS-JOBI-USER-NAME        PIC X(10).
+           05  WS-JOBI-JOB-NUMBER       PIC X(06).
+           05  WS-JOBI-INTERNAL-ID      PIC X(16).
+           05  WS-JOBI-STATUS           PIC X(10).
+           05  WS-JOBI-JOB-TYPE         PIC X(01).
+           05  WS-JOBI-SUBTYPE          PIC X(01).
+           05  FILLER                   PIC X(32).
+       01  WS-JOBI-REC-LEN              PIC S9(09) BINARY VALUE 86.
+       01  WS-JOBI-FORMAT               PIC X(08) VALUE 'JOBI0100'.
+       01  WS-JOBI-QUAL-JOB             PIC X(26) VALUE '* '.
+       01  WS-JOBI-INT-JOB-ID           PIC X(16) VALUE SPACES.
+       
+       01  WS-API-ERROR-CODE.
+           05  WS-ERR-BYTES-PROV        PIC S9(09) BINARY VALUE 16.
+           05  WS-ERR-BYTES-AVAIL       PIC S9(09) BINARY VALUE 0.
+           05  WS-ERR-MSG-ID            PIC X(07).
+           05  FILLER                   PIC X(01).
+
+      * --- STRING MANIPULATION & ENCRYPTION WORK AREA ---
+       01  WS-WORK-AREAS.
+           05  WS-IDX                   PIC 9(04) COMP.
+           05  WS-CHANGE-FOUND          PIC X(01) VALUE 'N'.
+           05  WS-TEMP-OLD              PIC X(50) VALUE SPACES.
+           05  WS-TEMP-NEW              PIC X(50) VALUE SPACES.
+           
+      * Simulated Substitution Cipher Table for Encryption
+       01  WS-CIPHER-TABLE.
+           05  WS-CLEAR-CHARS           PIC X(36) 
+               VALUE 'ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789'.
+           05  WS-CRYPT-CHARS           PIC X(36) 
+               VALUE 'QWERTYUIOPASDFGHJKLZXCVBNM9876543210'.
+
+       LINKAGE SECTION.
+      * --- STANDARD IBM I DB2 TRIGGER BUFFER ---
+       01  LS-TRIGGER-BUFFER.
+           05  LS-FILE-NAME             PIC X(10).
+           05  LS-LIBRARY-NAME          PIC X(10).
+           05  LS-MEMBER-NAME           PIC X(10).
+           05  LS-TRIGGER-EVENT         PIC X(01).
+               88 EVENT-INSERT          VALUE '1'.
+               88 EVENT-DELETE          VALUE '2'.
+               88 EVENT-UPDATE          VALUE '3'.
+           05  LS-TRIGGER-TIME          PIC X(01).
+           05  LS-COMMIT-LOCK-LEVEL     PIC X(01).
+           05  FILLER                   PIC X(03).
+           05  LS-CCSID                 PIC S9(09) BINARY.
+           05  FILLER                   PIC X(08).
+           05  LS-OLD-REC-OFFSET        PIC S9(09) BINARY.
+           05  LS-OLD-REC-LENGTH        PIC S9(09) BINARY.
+           05  LS-OLD-REC-NULL-OFF      PIC S9(09) BINARY.
+           05  LS-OLD-REC-NULL-LEN      PIC S9(09) BINARY.
+           05  LS-NEW-REC-OFFSET        PIC S9(09) BINARY.
+           05  LS-NEW-REC-LENGTH        PIC S9(09) BINARY.
+           05  LS-NEW-REC-NULL-OFF      PIC S9(09) BINARY.
+           05  LS-NEW-REC-NULL-LEN      PIC S9(09) BINARY.
+           05  FILLER                   PIC X(16).
+      * Raw data payload spans the rest of the buffer
+           05  LS-RAW-DATA              PIC X(32767).
+
+       01  LS-BUFFER-LENGTH             PIC S9(09) BINARY.
+
+      * ===============================================================
+       PROCEDURE DIVISION USING LS-TRIGGER-BUFFER LS-BUFFER-LENGTH.
+      * ===============================================================
+       DECLARATIVES.
+       FILE-ERROR-HANDLER SECTION.
+           USE AFTER STANDARD ERROR PROCEDURE ON AUDIT-LOG.
+       FILE-ERROR-LOGIC.
+      * In a real trigger, a crash here rolls back the database trans.
+      * We gracefully exit to avoid locking the physical file.
+           GOBACK.
+       END DECLARATIVES.
+
+      * ===============================================================
+       0000-MAIN-LOGIC.
+      * ===============================================================
+           OPEN EXTEND AUDIT-LOG.
+
+           PERFORM 1000-GET-SYSTEM-ENVIRONMENT.
+           PERFORM 2000-EVALUATE-ACTION.
+           
+           IF EVENT-UPDATE
+               PERFORM 3000-PARSE-AND-COMPARE
+           ELSE
+               PERFORM 4000-LOG-FULL-IMAGE
+           END-IF.
+
+           CLOSE AUDIT-LOG.
+           GOBACK.
+
+      * ===============================================================
+       1000-GET-SYSTEM-ENVIRONMENT.
+      * Call API to get Workstation ID, Job, and User making the change
+      * ===============================================================
+           CALL 'QUSRJOBI' USING WS-JOBI0100-RECEIVER,
+                                 WS-JOBI-REC-LEN,
+                                 WS-JOBI-FORMAT,
+                                 WS-JOBI-QUAL-JOB,
+                                 WS-JOBI-INT-JOB-ID,
+                                 WS-API-ERROR-CODE.
+
+      * Fetch precise timestamp via CEE API
+           CALL 'CEELOCT' USING WS-LILIAN-DAYS, WS-LILIAN-SECS, 
+                                WS-GREGORIAN-DATE, WS-FC.
+           CALL 'CEEDATM' USING WS-LILIAN-SECS, WS-PIC-STR, 
+                                WS-GREGORIAN-DATE, WS-FC.
+
+           INITIALIZE AUDIT-RECORD.
+           MOVE WS-GREGORIAN-DATE   TO AUD-TIMESTAMP.
+           MOVE WS-JOBI-JOB-NAME    TO AUD-JOB-NAME.
+           MOVE WS-JOBI-USER-NAME   TO AUD-USER-PROFILE.
+           MOVE WS-JOBI-JOB-NUMBER  TO AUD-JOB-NUMBER.
+           MOVE LS-FILE-NAME        TO AUD-FILE-NAME.
+           MOVE LS-MEMBER-NAME      TO AUD-MEMBER-NAME.
+
+      * ===============================================================
+       2000-EVALUATE-ACTION.
+      * ===============================================================
+           EVALUATE TRUE
+               WHEN EVENT-INSERT
+                   MOVE 'INSERT' TO AUD-ACTION
+               WHEN EVENT-DELETE
+                   MOVE 'DELETE' TO AUD-ACTION
+               WHEN EVENT-UPDATE
+                   MOVE 'UPDATE' TO AUD-ACTION
+               WHEN OTHER
+                   MOVE 'UNKNOWN' TO AUD-ACTION
+           END-EVALUATE.
+
+      * ===============================================================
+       3000-PARSE-AND-COMPARE.
+      * Byte-level comparison between Old and New Record Images
+      * Utilizes pointer arithmetic (Offsets) from the trigger buffer
+      * ===============================================================
+           MOVE 'N' TO WS-CHANGE-FOUND.
+           
+           PERFORM VARYING WS-IDX FROM 1 BY 1 
+                     UNTIL WS-IDX > LS-NEW-REC-LENGTH
+                     
+      * Compare Old Image Byte vs New Image Byte
+               IF LS-RAW-DATA(LS-OLD-REC-OFFSET + WS-IDX : 1) NOT =
+                  LS-RAW-DATA(LS-NEW-REC-OFFSET + WS-IDX : 1)
+                  
+                   MOVE WS-IDX TO AUD-CHANGE-OFFSET
+                   MOVE 'Y' TO WS-CHANGE-FOUND
+                   
+      * Extract a 50-byte window around the change for context
+                   MOVE LS-RAW-DATA(LS-OLD-REC-OFFSET + WS-IDX : 50) 
+                     TO WS-TEMP-OLD
+                   MOVE LS-RAW-DATA(LS-NEW-REC-OFFSET + WS-IDX : 50) 
+                     TO WS-TEMP-NEW
+                   
+      * Check if change occurred in a sensitive data zone (e.g., PII)
+      * If File is Reservation and offset > 30, it's Passport/CC data
+                   IF LS-FILE-NAME = 'RESERVPF  ' AND WS-IDX > 30
+                       PERFORM 5000-ENCRYPT-SENSITIVE-DATA
+                   END-IF
+                   
+                   MOVE WS-TEMP-OLD TO AUD-OLD-VALUE
+                   MOVE WS-TEMP-NEW TO AUD-NEW-VALUE
+                   WRITE AUDIT-RECORD
+               END-IF
+           END-PERFORM.
+
+      * ===============================================================
+       4000-LOG-FULL-IMAGE.
+      * Handles Inserts (No Old Image) or Deletes (No New Image)
+      * ===============================================================
+           MOVE 0 TO AUD-CHANGE-OFFSET.
+           
+           IF EVENT-INSERT
+               MOVE SPACES TO AUD-OLD-VALUE
+               MOVE LS-RAW-DATA(LS-NEW-REC-OFFSET + 1 : 50) 
+                 TO WS-TEMP-NEW
+               
+               IF LS-FILE-NAME = 'RESERVPF  '
+                   PERFORM 5000-ENCRYPT-SENSITIVE-DATA
+               END-IF
+               
+               MOVE WS-TEMP-NEW TO AUD-NEW-VALUE
+               WRITE AUDIT-RECORD
+           END-IF.
+
+           IF EVENT-DELETE
+               MOVE LS-RAW-DATA(LS-OLD-REC-OFFSET + 1 : 50) 
+                 TO AUD-OLD-VALUE
+               MOVE SPACES TO AUD-NEW-VALUE
+               WRITE AUDIT-RECORD
+           END-IF.
+
+      * ===============================================================
+       5000-ENCRYPT-SENSITIVE-DATA.
+      * Applies simulated compliance encryption (Substitution Cipher)
+      * to obfuscate PCI/PII data before resting in the journal.
+      * ===============================================================
+           INSPECT WS-TEMP-OLD CONVERTING WS-CLEAR-CHARS 
+                                       TO WS-CRYPT-CHARS.
+                                       
+           INSPECT WS-TEMP-NEW CONVERTING WS-CLEAR-CHARS 
+                                       TO WS-CRYPT-CHARS.

@@ -1,0 +1,583 @@
+       IDENTIFICATION DIVISION.
+       PROGRAM-ID. ALSIGNON.
+       AUTHOR. AIRLINE-ENTERPRISE-ARCHITECT.
+       INSTALLATION. AIRLINE-CORE-SYSTEMS.
+       DATE-WRITTEN. JUNE-2026.
+       DATE-COMPILED. 
+      *----------------------------------------------------------------*
+      * PROGRAM: ALSIGNON                                              *
+      * PURPOSE: CORE AUTHENTICATION AND ROLE ROUTING FOR AMS          *
+      *          (AIRLINE MANAGEMENT SYSTEM). HANDLES SIGN-ON,         *
+      *          PASSWORD EXPIRATION, ACCOUNT LOCKOUTS, AND ROLE       *
+      *          BASED ACCESS CONTROL (RBAC) ROUTING.                  *
+      *----------------------------------------------------------------*
+
+       ENVIRONMENT DIVISION.
+       CONFIGURATION SECTION.
+       SOURCE-COMPUTER. IBM-AS400.
+       OBJECT-COMPUTER. IBM-AS400.
+       
+       INPUT-OUTPUT SECTION.
+       FILE-CONTROL.
+      *    WORKSTATION DISPLAY FILE FOR SIGN-ON
+           SELECT ALSIGNOND-FILE 
+               ASSIGN TO WORKSTATION-ALSIGNOND
+               ORGANIZATION IS TRANSACTION
+               ACCESS MODE IS DYNAMIC
+               RELATIVE KEY IS WS-FORMAT-REC-NUM
+               FILE STATUS IS WS-DSPF-STATUS.
+
+      *    PHYSICAL FILE FOR USER CREDENTIALS AND RBAC
+           SELECT ALUSERPF-FILE 
+               ASSIGN TO DATABASE-ALUSERPF
+               ORGANIZATION IS INDEXED
+               ACCESS MODE IS RANDOM
+               RECORD KEY IS DB-USER-ID
+               FILE STATUS IS WS-DBPF-STATUS.
+
+       DATA DIVISION.
+       FILE SECTION.
+       
+       FD  ALSIGNOND-FILE
+           LABEL RECORDS ARE STANDARD.
+       01  ALSIGNOND-RECORD            PIC X(1920).
+       
+       FD  ALUSERPF-FILE
+           LABEL RECORDS ARE STANDARD.
+       01  ALUSERPF-RECORD.
+           05 DB-USER-ID               PIC X(10).
+           05 DB-PASSWORD-HASH         PIC X(64).
+           05 DB-USER-ROLE             PIC X(10).
+           05 DB-LAST-LOGIN-DATE       PIC 9(8).
+           05 DB-LAST-LOGIN-TIME       PIC 9(6).
+           05 DB-PWD-EXPIRY-DATE       PIC 9(8).
+           05 DB-FAILED-ATTEMPTS       PIC 9(1).
+           05 DB-ACCOUNT-LOCKED        PIC X(1).
+           05 DB-USER-STATUS           PIC X(1).
+           05 DB-CREATED-BY            PIC X(10).
+           05 DB-CREATED-DATE          PIC 9(8).
+           05 DB-UPDATED-BY            PIC X(10).
+           05 DB-UPDATED-DATE          PIC 9(8).
+
+       WORKING-STORAGE SECTION.
+      *----------------------------------------------------------------*
+      * SYSTEM AND AUDIT VARIABLES                                     *
+      *----------------------------------------------------------------*
+       01  WS-SYSTEM-VARIABLES.
+           05  WS-SYS-DATE             PIC 9(8).
+           05  WS-SYS-TIME             PIC 9(6).
+           05  WS-SYS-JOB-NAME         PIC X(10).
+           05  WS-SYS-USER-ID          PIC X(10).
+           05  WS-SYS-JOB-NUM          PIC X(6).
+           05  WS-PGM-NAME             PIC X(10) VALUE 'ALSIGNON'.
+           
+       01  WS-AUDIT-VARIABLES.
+           05  WS-AUDIT-TIMESTAMP      PIC X(26).
+           05  WS-AUDIT-TERMINAL-ID    PIC X(10).
+           05  WS-AUDIT-ACTION         PIC X(20).
+           05  WS-AUDIT-RESULT         PIC X(10).
+           05  WS-AUDIT-ATTEMPT-CNT    PIC 9(2) VALUE ZERO.
+           05  WS-MAX-LOGIN-ATTEMPTS   PIC 9(1) VALUE 3.
+
+      *----------------------------------------------------------------*
+      * FILE STATUS VARIABLES                                          *
+      *----------------------------------------------------------------*
+       01  WS-FILE-STATUS-VARS.
+           05  WS-DSPF-STATUS          PIC X(2) VALUE '00'.
+               88 DSPF-SUCCESS                  VALUE '00'.
+           05  WS-DBPF-STATUS          PIC X(2) VALUE '00'.
+               88 DBPF-SUCCESS                  VALUE '00'.
+               88 DBPF-NOT-FOUND                VALUE '23'.
+           05  WS-FORMAT-REC-NUM       PIC 9(4) VALUE 1.
+
+      *----------------------------------------------------------------*
+      * DISPLAY SCREEN DATA STRUCTURE (FORMAT: SIGNONF1)               *
+      *----------------------------------------------------------------*
+       01  WS-SCREEN-DATA.
+           05  WS-SCR-USER-ID          PIC X(10) VALUE SPACES.
+           05  WS-SCR-PASSWORD         PIC X(20) VALUE SPACES.
+           05  WS-SCR-NEW-PASSWORD     PIC X(20) VALUE SPACES.
+           05  WS-SCR-ERR-MSG          PIC X(50) VALUE SPACES.
+           05  WS-SCR-INFO-MSG         PIC X(50) VALUE SPACES.
+
+      *----------------------------------------------------------------*
+      * PROGRAM CONTROL FLAGS                                          *
+      *----------------------------------------------------------------*
+       01  WS-CONTROL-FLAGS.
+           05  WS-EXIT-FLAG            PIC X(1) VALUE 'N'.
+               88  USER-REQUESTED-EXIT          VALUE 'Y'.
+           05  WS-VALIDATION-FLAG      PIC X(1) VALUE 'N'.
+               88  CREDENTIALS-VALID            VALUE 'Y'.
+               88  CREDENTIALS-INVALID          VALUE 'N'.
+           05  WS-EXPIRY-FLAG          PIC X(1) VALUE 'N'.
+               88  PASSWORD-EXPIRED             VALUE 'Y'.
+           05  WS-LOCKED-FLAG          PIC X(1) VALUE 'N'.
+               88  ACCOUNT-IS-LOCKED            VALUE 'Y'.
+
+      *----------------------------------------------------------------*
+      * ROLE CONSTANTS                                                 *
+      *----------------------------------------------------------------*
+       01  WS-ROLE-CONSTANTS.
+           05  ROLE-ADMIN              PIC X(10) VALUE 'ADMIN     '.
+           05  ROLE-CREW               PIC X(10) VALUE 'CREW      '.
+           05  ROLE-DESK               PIC X(10) VALUE 'DESK      '.
+           05  ROLE-GUEST              PIC X(10) VALUE 'GUEST     '.
+
+      *----------------------------------------------------------------*
+      * 50+ EXPLICIT ERROR MESSAGES                                    *
+      *----------------------------------------------------------------*
+       01  WS-ERROR-MESSAGES.
+           05  ERR-001 PIC X(50) VALUE '001: USER ID CANNOT BE BLANK.'.
+           05  ERR-002 PIC X(50) VALUE '002: PASSWORD CANNOT BE BLANK.'.
+           05  ERR-003 PIC X(50) VALUE '003: INVALID USER ID OR PWD.'.
+           05  ERR-004 PIC X(50) VALUE '004: ACCOUNT LOCKED. CONTACT IT'.
+           05  ERR-005 PIC X(50) VALUE '005: PASSWORD EXPIRED.'.
+           05  ERR-006 PIC X(50) VALUE '006: DATABASE CONNECTION ERROR.'.
+           05  ERR-007 PIC X(50) VALUE '007: DISPLAY FILE OPEN ERROR.'.
+           05  ERR-008 PIC X(50) VALUE '008: INVALID FUNCTION KEY.'.
+           05  ERR-009 PIC X(50) VALUE '009: SYSTEM TIME UNAVAILABLE.'.
+           05  ERR-010 PIC X(50) VALUE '010: SYSTEM DATE UNAVAILABLE.'.
+           05  ERR-011 PIC X(50) VALUE '011: ROLE UNDEFINED FOR USER.'.
+           05  ERR-012 PIC X(50) VALUE '012: UNAUTHORIZED TERMINAL.'.
+           05  ERR-013 PIC X(50) VALUE '013: SESSION TIMEOUT OCCURRED.'.
+           05  ERR-014 PIC X(50) VALUE '014: PWD MUST BE > 8 CHARS.'.
+           05  ERR-015 PIC X(50) VALUE '015: PWD MUST CONTAIN NUMBERS.'.
+           05  ERR-016 PIC X(50) VALUE '016: PWD LACKS SPECIAL CHAR.'.
+           05  ERR-017 PIC X(50) VALUE '017: NEW PWD MATCHES OLD PWD.'.
+           05  ERR-018 PIC X(50) VALUE '018: CONCURRENT LOGIN BLOCKED.'.
+           05  ERR-019 PIC X(50) VALUE '019: USER ACCOUNT SUSPENDED.'.
+           05  ERR-020 PIC X(50) VALUE '020: USER ACCOUNT DELETED.'.
+           05  ERR-021 PIC X(50) VALUE '021: MAINTENANCE IN PROGRESS.'.
+           05  ERR-022 PIC X(50) VALUE '022: INVALID DB READ STATUS.'.
+           05  ERR-023 PIC X(50) VALUE '023: INVALID DB WRITE STATUS.'.
+           05  ERR-024 PIC X(50) VALUE '024: INVALID DB UPDATE STATUS.'.
+           05  ERR-025 PIC X(50) VALUE '025: FATAL I/O EXCEPTION.'.
+           05  ERR-026 PIC X(50) VALUE '026: ENCRYPTION MODULE FAIL.'.
+           05  ERR-027 PIC X(50) VALUE '027: HASHING ALGORITHM ERROR.'.
+           05  ERR-028 PIC X(50) VALUE '028: AUDIT LOG WRITE FAILED.'.
+           05  ERR-029 PIC X(50) VALUE '029: MAXIMUM RETRIES EXCEEDED.'.
+           05  ERR-030 PIC X(50) VALUE '030: NETWORK TIMEOUT.'.
+           05  ERR-031 PIC X(50) VALUE '031: INVALID WORKSTATION ID.'.
+           05  ERR-032 PIC X(50) VALUE '032: PROGRAM CALL FAILED.'.
+           05  ERR-033 PIC X(50) VALUE '033: ADMIN MENU LOAD FAILED.'.
+           05  ERR-034 PIC X(50) VALUE '034: CREW MENU LOAD FAILED.'.
+           05  ERR-035 PIC X(50) VALUE '035: DESK MENU LOAD FAILED.'.
+           05  ERR-036 PIC X(50) VALUE '036: ROUTING TABLE CORRUPT.'.
+           05  ERR-037 PIC X(50) VALUE '037: INTERNAL MEMORY FAULT.'.
+           05  ERR-038 PIC X(50) VALUE '038: PARAMETER MISMATCH.'.
+           05  ERR-039 PIC X(50) VALUE '039: ILLEGAL STATE EXCEPTION.'.
+           05  ERR-040 PIC X(50) VALUE '040: USER PROFILE CORRUPTED.'.
+           05  ERR-041 PIC X(50) VALUE '041: REQUIRED FIELD MISSING.'.
+           05  ERR-042 PIC X(50) VALUE '042: INPUT CONTAINS SQL INJ.'.
+           05  ERR-043 PIC X(50) VALUE '043: CROSS-SITE SCRIPT BLOCK.'.
+           05  ERR-044 PIC X(50) VALUE '044: UNKNOWN PROTOCOL VER.'.
+           05  ERR-045 PIC X(50) VALUE '045: CERTIFICATE EXPIRED.'.
+           05  ERR-046 PIC X(50) VALUE '046: SSL HANDSHAKE FAILED.'.
+           05  ERR-047 PIC X(50) VALUE '047: REGISTRY ACCESS DENIED.'.
+           05  ERR-048 PIC X(50) VALUE '048: SPOOL FILE ALLOC ERROR.'.
+           05  ERR-049 PIC X(50) VALUE '049: QUEUE MANAGER OFFLINE.'.
+           05  ERR-050 PIC X(50) VALUE '050: SUBSYSTEM UNAVAILABLE.'.
+           05  ERR-051 PIC X(50) VALUE '051: API GATEWAY TIMEOUT.'.
+           05  ERR-052 PIC X(50) VALUE '052: DATA TRUNCATION ERROR.'.
+
+      *----------------------------------------------------------------*
+      * EXPLICIT SCREEN INDICATORS (*IN01 THROUGH *IN99)               *
+      *----------------------------------------------------------------*
+       01  WS-INDICATORS.
+           05  IN01 PIC 1 INDICATOR 01.
+           05  IN02 PIC 1 INDICATOR 02.
+           05  IN03 PIC 1 INDICATOR 03.
+           05  IN04 PIC 1 INDICATOR 04.
+           05  IN05 PIC 1 INDICATOR 05.
+           05  IN06 PIC 1 INDICATOR 06.
+           05  IN07 PIC 1 INDICATOR 07.
+           05  IN08 PIC 1 INDICATOR 08.
+           05  IN09 PIC 1 INDICATOR 09.
+           05  IN10 PIC 1 INDICATOR 10.
+           05  IN11 PIC 1 INDICATOR 11.
+           05  IN12 PIC 1 INDICATOR 12.
+           05  IN13 PIC 1 INDICATOR 13.
+           05  IN14 PIC 1 INDICATOR 14.
+           05  IN15 PIC 1 INDICATOR 15.
+           05  IN16 PIC 1 INDICATOR 16.
+           05  IN17 PIC 1 INDICATOR 17.
+           05  IN18 PIC 1 INDICATOR 18.
+           05  IN19 PIC 1 INDICATOR 19.
+           05  IN20 PIC 1 INDICATOR 20.
+           05  IN21 PIC 1 INDICATOR 21.
+           05  IN22 PIC 1 INDICATOR 22.
+           05  IN23 PIC 1 INDICATOR 23.
+           05  IN24 PIC 1 INDICATOR 24.
+           05  IN25 PIC 1 INDICATOR 25.
+           05  IN26 PIC 1 INDICATOR 26.
+           05  IN27 PIC 1 INDICATOR 27.
+           05  IN28 PIC 1 INDICATOR 28.
+           05  IN29 PIC 1 INDICATOR 29.
+           05  IN30 PIC 1 INDICATOR 30.
+           05  IN31 PIC 1 INDICATOR 31.
+           05  IN32 PIC 1 INDICATOR 32.
+           05  IN33 PIC 1 INDICATOR 33.
+           05  IN34 PIC 1 INDICATOR 34.
+           05  IN35 PIC 1 INDICATOR 35.
+           05  IN36 PIC 1 INDICATOR 36.
+           05  IN37 PIC 1 INDICATOR 37.
+           05  IN38 PIC 1 INDICATOR 38.
+           05  IN39 PIC 1 INDICATOR 39.
+           05  IN40 PIC 1 INDICATOR 40.
+           05  IN41 PIC 1 INDICATOR 41.
+           05  IN42 PIC 1 INDICATOR 42.
+           05  IN43 PIC 1 INDICATOR 43.
+           05  IN44 PIC 1 INDICATOR 44.
+           05  IN45 PIC 1 INDICATOR 45.
+           05  IN46 PIC 1 INDICATOR 46.
+           05  IN47 PIC 1 INDICATOR 47.
+           05  IN48 PIC 1 INDICATOR 48.
+           05  IN49 PIC 1 INDICATOR 49.
+           05  IN50 PIC 1 INDICATOR 50.
+           05  IN51 PIC 1 INDICATOR 51.
+           05  IN52 PIC 1 INDICATOR 52.
+           05  IN53 PIC 1 INDICATOR 53.
+           05  IN54 PIC 1 INDICATOR 54.
+           05  IN55 PIC 1 INDICATOR 55.
+           05  IN56 PIC 1 INDICATOR 56.
+           05  IN57 PIC 1 INDICATOR 57.
+           05  IN58 PIC 1 INDICATOR 58.
+           05  IN59 PIC 1 INDICATOR 59.
+           05  IN60 PIC 1 INDICATOR 60.
+           05  IN61 PIC 1 INDICATOR 61.
+           05  IN62 PIC 1 INDICATOR 62.
+           05  IN63 PIC 1 INDICATOR 63.
+           05  IN64 PIC 1 INDICATOR 64.
+           05  IN65 PIC 1 INDICATOR 65.
+           05  IN66 PIC 1 INDICATOR 66.
+           05  IN67 PIC 1 INDICATOR 67.
+           05  IN68 PIC 1 INDICATOR 68.
+           05  IN69 PIC 1 INDICATOR 69.
+           05  IN70 PIC 1 INDICATOR 70.
+           05  IN71 PIC 1 INDICATOR 71.
+           05  IN72 PIC 1 INDICATOR 72.
+           05  IN73 PIC 1 INDICATOR 73.
+           05  IN74 PIC 1 INDICATOR 74.
+           05  IN75 PIC 1 INDICATOR 75.
+           05  IN76 PIC 1 INDICATOR 76.
+           05  IN77 PIC 1 INDICATOR 77.
+           05  IN78 PIC 1 INDICATOR 78.
+           05  IN79 PIC 1 INDICATOR 79.
+           05  IN80 PIC 1 INDICATOR 80.
+           05  IN81 PIC 1 INDICATOR 81.
+           05  IN82 PIC 1 INDICATOR 82.
+           05  IN83 PIC 1 INDICATOR 83.
+           05  IN84 PIC 1 INDICATOR 84.
+           05  IN85 PIC 1 INDICATOR 85.
+           05  IN86 PIC 1 INDICATOR 86.
+           05  IN87 PIC 1 INDICATOR 87.
+           05  IN88 PIC 1 INDICATOR 88.
+           05  IN89 PIC 1 INDICATOR 89.
+           05  IN90 PIC 1 INDICATOR 90.
+           05  IN91 PIC 1 INDICATOR 91.
+           05  IN92 PIC 1 INDICATOR 92.
+           05  IN93 PIC 1 INDICATOR 93.
+           05  IN94 PIC 1 INDICATOR 94.
+           05  IN95 PIC 1 INDICATOR 95.
+           05  IN96 PIC 1 INDICATOR 96.
+           05  IN97 PIC 1 INDICATOR 97.
+           05  IN98 PIC 1 INDICATOR 98.
+           05  IN99 PIC 1 INDICATOR 99.
+
+       PROCEDURE DIVISION.
+       0000-MAINLINE.
+           PERFORM 1000-INITIALIZATION
+           
+           PERFORM 2000-PROCESS-SIGNON 
+               UNTIL USER-REQUESTED-EXIT 
+                  OR CREDENTIALS-VALID
+                  
+           IF CREDENTIALS-VALID
+               PERFORM 7000-AUDIT-SUCCESS-LOGIN
+               PERFORM 8000-ROUTE-USER-ROLE
+           END-IF
+
+           PERFORM 9000-TERMINATION.
+           STOP RUN.
+
+       1000-INITIALIZATION.
+           ACCEPT WS-SYS-DATE FROM DATE
+           ACCEPT WS-SYS-TIME FROM TIME
+           
+           OPEN I-O ALUSERPF-FILE
+           IF NOT DBPF-SUCCESS
+               MOVE ERR-006 TO WS-SCR-ERR-MSG
+               PERFORM 9900-FATAL-ERROR-EXIT
+           END-IF
+
+           OPEN I-O ALSIGNOND-FILE
+           IF NOT DSPF-SUCCESS
+               MOVE ERR-007 TO WS-SCR-ERR-MSG
+               PERFORM 9900-FATAL-ERROR-EXIT
+           END-IF
+           
+           MOVE SPACES TO WS-SCR-USER-ID
+           MOVE SPACES TO WS-SCR-PASSWORD
+           MOVE SPACES TO WS-SCR-ERR-MSG
+           MOVE ZERO TO WS-AUDIT-ATTEMPT-CNT.
+
+       2000-PROCESS-SIGNON.
+      *    WRITE TO SCREEN
+           WRITE ALSIGNOND-RECORD FORMAT IS 'SIGNONF1'
+               INDICATORS ARE WS-INDICATORS
+           READ ALSIGNOND-FILE RECORD 
+               INDICATORS ARE WS-INDICATORS
+           
+           PERFORM 3000-EVALUATE-INDICATORS.
+           
+           IF NOT USER-REQUESTED-EXIT
+               PERFORM 4000-VALIDATE-INPUTS
+               IF WS-SCR-ERR-MSG = SPACES
+                   PERFORM 5000-AUTHENTICATE-USER
+               END-IF
+           END-IF.
+
+       3000-EVALUATE-INDICATORS.
+      *    RESET ERROR STATE ON NEW INTERACTION
+           MOVE SPACES TO WS-SCR-ERR-MSG
+           
+      *    EXHAUSTIVE EVALUATION OF ALL SCREEN INDICATORS
+           EVALUATE TRUE
+               WHEN IN01 = B"1"
+                   MOVE ERR-008 TO WS-SCR-ERR-MSG
+               WHEN IN02 = B"1"
+                   MOVE ERR-008 TO WS-SCR-ERR-MSG
+               WHEN IN03 = B"1"
+                   MOVE 'Y' TO WS-EXIT-FLAG
+               WHEN IN04 = B"1"
+                   MOVE ERR-008 TO WS-SCR-ERR-MSG
+               WHEN IN05 = B"1"
+                   MOVE ERR-008 TO WS-SCR-ERR-MSG
+               WHEN IN06 = B"1"
+                   MOVE ERR-008 TO WS-SCR-ERR-MSG
+               WHEN IN07 = B"1"
+                   MOVE ERR-008 TO WS-SCR-ERR-MSG
+               WHEN IN08 = B"1"
+                   MOVE ERR-008 TO WS-SCR-ERR-MSG
+               WHEN IN09 = B"1"
+                   MOVE ERR-008 TO WS-SCR-ERR-MSG
+               WHEN IN10 = B"1"
+                   MOVE ERR-008 TO WS-SCR-ERR-MSG
+               WHEN IN11 = B"1"
+                   MOVE ERR-008 TO WS-SCR-ERR-MSG
+               WHEN IN12 = B"1"
+                   MOVE 'Y' TO WS-EXIT-FLAG
+               WHEN IN13 = B"1"
+                   MOVE ERR-008 TO WS-SCR-ERR-MSG
+               WHEN IN14 = B"1"
+                   MOVE ERR-008 TO WS-SCR-ERR-MSG
+               WHEN IN15 = B"1"
+                   MOVE ERR-008 TO WS-SCR-ERR-MSG
+               WHEN IN16 = B"1"
+                   MOVE ERR-008 TO WS-SCR-ERR-MSG
+               WHEN IN17 = B"1"
+                   MOVE ERR-008 TO WS-SCR-ERR-MSG
+               WHEN IN18 = B"1"
+                   MOVE ERR-008 TO WS-SCR-ERR-MSG
+               WHEN IN19 = B"1"
+                   MOVE ERR-008 TO WS-SCR-ERR-MSG
+               WHEN IN20 = B"1"
+                   MOVE ERR-008 TO WS-SCR-ERR-MSG
+               WHEN IN21 = B"1"
+                   MOVE ERR-008 TO WS-SCR-ERR-MSG
+               WHEN IN22 = B"1"
+                   MOVE ERR-008 TO WS-SCR-ERR-MSG
+               WHEN IN23 = B"1"
+                   MOVE ERR-008 TO WS-SCR-ERR-MSG
+               WHEN IN24 = B"1"
+                   MOVE ERR-008 TO WS-SCR-ERR-MSG
+               
+      *        INDICATORS 25-99 EVALUATION FOR DISPLAY ATTRIBUTES
+      *        OR SUBFILE CONTROLS IF EXPANDED
+               WHEN IN25 = B"1" MOVE ERR-039 TO WS-SCR-ERR-MSG
+               WHEN IN26 = B"1" MOVE ERR-039 TO WS-SCR-ERR-MSG
+               WHEN IN27 = B"1" MOVE ERR-039 TO WS-SCR-ERR-MSG
+               WHEN IN28 = B"1" MOVE ERR-039 TO WS-SCR-ERR-MSG
+               WHEN IN29 = B"1" MOVE ERR-039 TO WS-SCR-ERR-MSG
+               WHEN IN30 = B"1" MOVE B"0" TO IN30
+               WHEN IN31 = B"1" MOVE B"0" TO IN31
+               WHEN IN32 = B"1" MOVE B"0" TO IN32
+               WHEN IN33 = B"1" MOVE B"0" TO IN33
+               WHEN IN34 = B"1" MOVE B"0" TO IN34
+               WHEN IN35 = B"1" MOVE B"0" TO IN35
+               WHEN IN36 = B"1" MOVE B"0" TO IN36
+               WHEN IN37 = B"1" MOVE B"0" TO IN37
+               WHEN IN38 = B"1" MOVE B"0" TO IN38
+               WHEN IN39 = B"1" MOVE B"0" TO IN39
+               WHEN IN40 = B"1" MOVE B"0" TO IN40
+               WHEN IN41 = B"1" MOVE B"0" TO IN41
+               WHEN IN42 = B"1" MOVE B"0" TO IN42
+               WHEN IN43 = B"1" MOVE B"0" TO IN43
+               WHEN IN44 = B"1" MOVE B"0" TO IN44
+               WHEN IN45 = B"1" MOVE B"0" TO IN45
+               WHEN IN46 = B"1" MOVE B"0" TO IN46
+               WHEN IN47 = B"1" MOVE B"0" TO IN47
+               WHEN IN48 = B"1" MOVE B"0" TO IN48
+               WHEN IN49 = B"1" MOVE B"0" TO IN49
+               WHEN IN50 = B"1" MOVE B"0" TO IN50
+               WHEN IN51 = B"1" MOVE B"0" TO IN51
+               WHEN IN52 = B"1" MOVE B"0" TO IN52
+               WHEN IN53 = B"1" MOVE B"0" TO IN53
+               WHEN IN54 = B"1" MOVE B"0" TO IN54
+               WHEN IN55 = B"1" MOVE B"0" TO IN55
+               WHEN IN56 = B"1" MOVE B"0" TO IN56
+               WHEN IN57 = B"1" MOVE B"0" TO IN57
+               WHEN IN58 = B"1" MOVE B"0" TO IN58
+               WHEN IN59 = B"1" MOVE B"0" TO IN59
+               WHEN IN60 = B"1" MOVE B"0" TO IN60
+               WHEN IN61 = B"1" MOVE B"0" TO IN61
+               WHEN IN62 = B"1" MOVE B"0" TO IN62
+               WHEN IN63 = B"1" MOVE B"0" TO IN63
+               WHEN IN64 = B"1" MOVE B"0" TO IN64
+               WHEN IN65 = B"1" MOVE B"0" TO IN65
+               WHEN IN66 = B"1" MOVE B"0" TO IN66
+               WHEN IN67 = B"1" MOVE B"0" TO IN67
+               WHEN IN68 = B"1" MOVE B"0" TO IN68
+               WHEN IN69 = B"1" MOVE B"0" TO IN69
+               WHEN IN70 = B"1" MOVE B"0" TO IN70
+               WHEN IN71 = B"1" MOVE B"0" TO IN71
+               WHEN IN72 = B"1" MOVE B"0" TO IN72
+               WHEN IN73 = B"1" MOVE B"0" TO IN73
+               WHEN IN74 = B"1" MOVE B"0" TO IN74
+               WHEN IN75 = B"1" MOVE B"0" TO IN75
+               WHEN IN76 = B"1" MOVE B"0" TO IN76
+               WHEN IN77 = B"1" MOVE B"0" TO IN77
+               WHEN IN78 = B"1" MOVE B"0" TO IN78
+               WHEN IN79 = B"1" MOVE B"0" TO IN79
+               WHEN IN80 = B"1" MOVE B"0" TO IN80
+               WHEN IN81 = B"1" MOVE B"0" TO IN81
+               WHEN IN82 = B"1" MOVE B"0" TO IN82
+               WHEN IN83 = B"1" MOVE B"0" TO IN83
+               WHEN IN84 = B"1" MOVE B"0" TO IN84
+               WHEN IN85 = B"1" MOVE B"0" TO IN85
+               WHEN IN86 = B"1" MOVE B"0" TO IN86
+               WHEN IN87 = B"1" MOVE B"0" TO IN87
+               WHEN IN88 = B"1" MOVE B"0" TO IN88
+               WHEN IN89 = B"1" MOVE B"0" TO IN89
+               WHEN IN90 = B"1" MOVE B"0" TO IN90
+               WHEN IN91 = B"1" MOVE B"0" TO IN91
+               WHEN IN92 = B"1" MOVE B"0" TO IN92
+               WHEN IN93 = B"1" MOVE B"0" TO IN93
+               WHEN IN94 = B"1" MOVE B"0" TO IN94
+               WHEN IN95 = B"1" MOVE B"0" TO IN95
+               WHEN IN96 = B"1" MOVE B"0" TO IN96
+               WHEN IN97 = B"1" MOVE B"0" TO IN97
+               WHEN IN98 = B"1" MOVE B"0" TO IN98
+               WHEN IN99 = B"1" MOVE B"0" TO IN99
+           END-EVALUATE.
+
+       4000-VALIDATE-INPUTS.
+           IF WS-SCR-USER-ID = SPACES
+               MOVE ERR-001 TO WS-SCR-ERR-MSG
+           ELSE IF WS-SCR-PASSWORD = SPACES
+               MOVE ERR-002 TO WS-SCR-ERR-MSG
+           END-IF.
+
+       5000-AUTHENTICATE-USER.
+           MOVE WS-SCR-USER-ID TO DB-USER-ID
+           READ ALUSERPF-FILE
+           
+           IF DBPF-NOT-FOUND
+               MOVE ERR-003 TO WS-SCR-ERR-MSG
+               PERFORM 7100-AUDIT-FAILED-LOGIN
+               GO TO 5000-EXIT
+           ELSE IF NOT DBPF-SUCCESS
+               MOVE ERR-022 TO WS-SCR-ERR-MSG
+               GO TO 5000-EXIT
+           END-IF
+
+           IF DB-ACCOUNT-LOCKED = 'Y'
+               MOVE ERR-004 TO WS-SCR-ERR-MSG
+               PERFORM 7100-AUDIT-FAILED-LOGIN
+               GO TO 5000-EXIT
+           END-IF
+
+           IF DB-PASSWORD-HASH NOT EQUAL WS-SCR-PASSWORD
+               ADD 1 TO DB-FAILED-ATTEMPTS
+               IF DB-FAILED-ATTEMPTS >= WS-MAX-LOGIN-ATTEMPTS
+                   MOVE 'Y' TO DB-ACCOUNT-LOCKED
+                   MOVE ERR-029 TO WS-SCR-ERR-MSG
+               ELSE
+                   MOVE ERR-003 TO WS-SCR-ERR-MSG
+               END-IF
+               REWRITE ALUSERPF-RECORD
+               PERFORM 7100-AUDIT-FAILED-LOGIN
+               GO TO 5000-EXIT
+           END-IF
+
+           PERFORM 6000-CHECK-PASSWORD-EXPIRY
+           
+           IF PASSWORD-EXPIRED
+               MOVE ERR-005 TO WS-SCR-ERR-MSG
+               GO TO 5000-EXIT
+           END-IF
+
+      *    SUCCESSFUL AUTHENTICATION
+           MOVE 'Y' TO WS-VALIDATION-FLAG
+           MOVE ZERO TO DB-FAILED-ATTEMPTS
+           MOVE WS-SYS-DATE TO DB-LAST-LOGIN-DATE
+           MOVE WS-SYS-TIME TO DB-LAST-LOGIN-TIME
+           REWRITE ALUSERPF-RECORD
+           IF NOT DBPF-SUCCESS
+               MOVE ERR-024 TO WS-SCR-ERR-MSG
+               MOVE 'N' TO WS-VALIDATION-FLAG
+           END-IF.
+
+       5000-EXIT.
+           EXIT.
+
+       6000-CHECK-PASSWORD-EXPIRY.
+           IF WS-SYS-DATE > DB-PWD-EXPIRY-DATE
+               MOVE 'Y' TO WS-EXPIRY-FLAG
+           ELSE
+               MOVE 'N' TO WS-EXPIRY-FLAG
+           END-IF.
+
+       7000-AUDIT-SUCCESS-LOGIN.
+      *    IN A REAL SYSTEM, THIS WOULD WRITE TO JRN OR AUDIT PF
+           MOVE 'LOGIN_SUCCESS' TO WS-AUDIT-ACTION.
+
+       7100-AUDIT-FAILED-LOGIN.
+           MOVE 'LOGIN_FAILED' TO WS-AUDIT-ACTION.
+
+       8000-ROUTE-USER-ROLE.
+           EVALUATE DB-USER-ROLE
+               WHEN ROLE-ADMIN
+                   CALL 'ALMENUADM' USING WS-SCR-USER-ID
+                   ON EXCEPTION
+                       MOVE ERR-033 TO WS-SCR-ERR-MSG
+                       PERFORM 9900-FATAL-ERROR-EXIT
+                   END-CALL
+               WHEN ROLE-CREW
+                   CALL 'ALMENUCRW' USING WS-SCR-USER-ID
+                   ON EXCEPTION
+                       MOVE ERR-034 TO WS-SCR-ERR-MSG
+                       PERFORM 9900-FATAL-ERROR-EXIT
+                   END-CALL
+               WHEN ROLE-DESK
+                   CALL 'ALMENUDSK' USING WS-SCR-USER-ID
+                   ON EXCEPTION
+                       MOVE ERR-035 TO WS-SCR-ERR-MSG
+                       PERFORM 9900-FATAL-ERROR-EXIT
+                   END-CALL
+               WHEN OTHER
+                   MOVE ERR-011 TO WS-SCR-ERR-MSG
+                   PERFORM 9900-FATAL-ERROR-EXIT
+           END-EVALUATE.
+
+       9000-TERMINATION.
+           CLOSE ALSIGNOND-FILE
+           CLOSE ALUSERPF-FILE.
+           
+       9900-FATAL-ERROR-EXIT.
+      *    LAST RESORT SCREEN DUMP BEFORE ABNORMAL END
+           WRITE ALSIGNOND-RECORD FORMAT IS 'SIGNONF1'
+               INDICATORS ARE WS-INDICATORS
+           CLOSE ALSIGNOND-FILE
+           CLOSE ALUSERPF-FILE
+           STOP RUN.

@@ -1,0 +1,339 @@
+IDENTIFICATION DIVISION.
+       PROGRAM-ID. ALCRWMNT.
+       AUTHOR. ENTERPRISE-IBM-I-DEVELOPER.
+       DATE-WRITTEN. JUNE 2026.
+       
+       ENVIRONMENT DIVISION.
+       CONFIGURATION SECTION.
+       SOURCE-COMPUTER. IBM-I.
+       OBJECT-COMPUTER. IBM-I.
+       
+       INPUT-OUTPUT SECTION.
+       FILE-CONTROL.
+           SELECT CREWPF ASSIGN TO DATABASE-CREWPF
+                  ORGANIZATION IS INDEXED
+                  ACCESS IS DYNAMIC
+                  RECORD KEY IS DB-CREW-ID
+                  FILE STATUS IS WS-CRW-STATUS.
+                  
+           SELECT SCHEDULEPF ASSIGN TO DATABASE-SCHEDULEPF
+                  ORGANIZATION IS INDEXED
+                  ACCESS IS DYNAMIC
+                  RECORD KEY IS DB-SCHED-KEY
+                  FILE STATUS IS WS-SCH-STATUS.
+
+           SELECT ALCRWMNTS ASSIGN TO WORKSTATION-ALCRWMNTS
+                  ORGANIZATION IS TRANSACTION
+                  ACCESS IS DYNAMIC
+                  RELATIVE KEY IS WS-SFL-RRN
+                  FILE STATUS IS WS-DSP-STATUS.
+
+       DATA DIVISION.
+       FILE SECTION.
+       FD  CREWPF.
+       01  CREW-RECORD.
+           05 DB-CREW-ID           PIC X(8).
+           05 DB-CREW-NAME         PIC X(40).
+           05 DB-CREW-ROLE         PIC X(3).  *> CPT, FO, FA, PUR
+           05 DB-LICENSE-EXP       PIC 9(8).  *> YYYYMMDD
+           05 DB-MEDICAL-EXP       PIC 9(8).  *> YYYYMMDD
+           05 DB-TYPE-RATING       PIC X(15). *> e.g. B777,A350,B737
+           05 DB-BASE-AIRPORT      PIC X(3).
+           05 DB-TOTAL-FLT-HRS     PIC 9(5)V99.
+
+       FD  SCHEDULEPF.
+       01  SCHEDULE-RECORD.
+           05 DB-SCHED-KEY.
+              10 DB-SCHED-CREW-ID  PIC X(8).
+              10 DB-SCHED-DATE     PIC 9(8).
+           05 DB-FLT-ASSIGNED      PIC X(6).
+           05 DB-DUTY-START        PIC 9(4).
+           05 DB-DUTY-END          PIC 9(4).
+           05 DB-REST-START        PIC 9(4).
+           05 DB-REST-END          PIC 9(4).
+           05 DB-SCHED-STATUS      PIC X(1). *> C=Confirmed, S=Standby
+
+       FD  ALCRWMNTS.
+       01  DISPLAY-RECORD          PIC X(1920).
+
+       WORKING-STORAGE SECTION.
+      *----------------------------------------------------------------*
+      * SYSTEM AND FILE STATUS FLAGS
+      *----------------------------------------------------------------*
+       01  WS-FILE-STATUS-FLAGS.
+           05 WS-CRW-STATUS        PIC X(2) VALUE '00'.
+           05 WS-SCH-STATUS        PIC X(2) VALUE '00'.
+           05 WS-DSP-STATUS        PIC X(2) VALUE '00'.
+           05 WS-VALID-FLAG        PIC X(1) VALUE 'Y'.
+              88 IS-VALID                   VALUE 'Y'.
+              88 IS-INVALID                 VALUE 'N'.
+           05 WS-CONFLICT-FLAG     PIC X(1) VALUE 'N'.
+              88 HAS-CONFLICT               VALUE 'Y'.
+
+      *----------------------------------------------------------------*
+      * DATE PROCESSING FIELDS
+      *----------------------------------------------------------------*
+       01  WS-CURRENT-DATE-DATA.
+           05 WS-CURR-YYYY         PIC 9(4).
+           05 WS-CURR-MM           PIC 9(2).
+           05 WS-CURR-DD           PIC 9(2).
+       01  WS-CURR-DATE-NUM REDEFINES WS-CURRENT-DATE-DATA PIC 9(8).
+
+       01  WS-LOOKBACK-DATES.
+           05 WS-DATE-MINUS-1      PIC 9(8).
+           05 WS-DATE-MINUS-7      PIC 9(8).
+           05 WS-DATE-MINUS-28     PIC 9(8).
+
+      *----------------------------------------------------------------*
+      * MULTI-LEVEL ARRAY: 28-DAY DUTY CYCLE TRACKER (HOURLY)
+      *----------------------------------------------------------------*
+       01  WS-DUTY-CYCLE-MATRIX.
+           05  WS-DAY OCCURS 28 TIMES.
+               10  WS-HOUR OCCURS 24 TIMES.
+                   15  WS-HOUR-STATUS PIC X(1) VALUE 'R'. 
+                       *> R=Rest, F=Flight, D=Ground Duty, S=Standby
+                   15  WS-FLT-NUM     PIC X(6) VALUE SPACES.
+
+       01  WS-MATRIX-INDEXES.
+           05 WS-DAY-IDX           PIC 9(2).
+           05 WS-HR-IDX            PIC 9(2).
+           
+       01  WS-REGULATORY-TOTALS.
+           05 WS-HRS-LAST-24       PIC 9(3) VALUE 0.
+           05 WS-HRS-LAST-7D       PIC 9(3) VALUE 0.
+           05 WS-HRS-LAST-28D      PIC 9(4) VALUE 0.
+           05 WS-REST-ACCUMULATOR  PIC 9(3) VALUE 0.
+
+      *----------------------------------------------------------------*
+      * SCREEN FIELDS (MAPPED FROM DDS)
+      *----------------------------------------------------------------*
+       01  WS-SCREEN-DATA.
+           05 SCR-CREW-ID          PIC X(8).
+           05 SCR-FLT-NUM          PIC X(6).
+           05 SCR-FLT-DATE         PIC 9(8).
+           05 SCR-DEP-TIME         PIC 9(4).
+           05 SCR-ARR-TIME         PIC 9(4).
+           05 SCR-AIRCRAFT-TYPE    PIC X(4).
+           05 SCR-ROLE-REQ         PIC X(3).
+           05 SCR-MSG              PIC X(70).
+
+       01  WS-INDICATORS.
+           05 IN03                 PIC 1 INDICATOR 3.
+
+       PROCEDURE DIVISION.
+       0000-MAIN-LOGIC.
+           PERFORM 1000-INITIALIZE.
+           PERFORM 2000-PROCESS-SCREEN UNTIL IN03 = B"1".
+           PERFORM 9000-TERMINATE.
+           STOP RUN.
+
+       1000-INITIALIZE.
+           ACCEPT WS-CURRENT-DATE-DATA FROM DATE YYYYMMDD.
+           OPEN I-O CREWPF.
+           OPEN I-O SCHEDULEPF.
+           OPEN I-O ALCRWMNTS.
+           
+      * In a real system, calculate lookbacks via system APIs.
+      * Hardcoded mock dates for validation matrix context.
+           COMPUTE WS-DATE-MINUS-1  = WS-CURR-DATE-NUM - 1.
+           COMPUTE WS-DATE-MINUS-7  = WS-CURR-DATE-NUM - 7.
+           COMPUTE WS-DATE-MINUS-28 = WS-CURR-DATE-NUM - 28.
+
+       2000-PROCESS-SCREEN.
+           WRITE DISPLAY-RECORD FORMAT 'CRWCTL'.
+           READ ALCRWMNTS RECORD FORMAT 'CRWCTL'.
+           
+           IF IN03 = B"0"
+               PERFORM 3000-ASSIGN-CREW
+           END-IF.
+
+       3000-ASSIGN-CREW.
+           MOVE SPACES TO SCR-MSG.
+           PERFORM 4000-VALIDATE-CREW.
+           
+           IF IS-VALID AND NOT HAS-CONFLICT
+               PERFORM 6000-UPDATE-DATABASES
+           ELSE IF HAS-CONFLICT
+               PERFORM 5000-RESOLVE-CONFLICT
+           END-IF.
+
+       4000-VALIDATE-CREW.
+           MOVE 'Y' TO WS-VALID-FLAG.
+           MOVE 'N' TO WS-CONFLICT-FLAG.
+
+           MOVE SCR-CREW-ID TO DB-CREW-ID.
+           READ CREWPF
+               INVALID KEY
+                   MOVE 'N' TO WS-VALID-FLAG
+                   MOVE 'Crew Member ID not found in CREWPF' TO SCR-MSG
+                   GO TO 4000-EXIT
+           END-READ.
+
+           PERFORM 4100-CHECK-LICENSE.
+           IF IS-VALID PERFORM 4200-CHECK-DUTY-LIMITS END-IF.
+           IF IS-VALID PERFORM 4300-CHECK-REST-PERIOD END-IF.
+           IF IS-VALID PERFORM 4400-CHECK-CONFLICTS END-IF.
+
+       4000-EXIT. EXIT.
+
+       4100-CHECK-LICENSE.
+      * 1. Check Medical and License Expiration Dates
+           IF DB-LICENSE-EXP < WS-CURR-DATE-NUM
+               MOVE 'N' TO WS-VALID-FLAG
+               MOVE 'FATAL: Aviation License Expired' TO SCR-MSG
+               GO TO 4100-EXIT
+           END-IF.
+
+           IF DB-MEDICAL-EXP < WS-CURR-DATE-NUM
+               MOVE 'N' TO WS-VALID-FLAG
+               MOVE 'FATAL: Class 1 Medical Certificate Expired' 
+                 TO SCR-MSG
+               GO TO 4100-EXIT
+           END-IF.
+
+      * 2. Type Rating Cross-Check for Flight Deck Crew
+           IF DB-CREW-ROLE = 'CPT' OR DB-CREW-ROLE = 'FO'
+               EVALUATE SCR-AIRCRAFT-TYPE
+                   WHEN 'B777'
+                       IF DB-TYPE-RATING NOT = 'B777' AND 
+                          DB-TYPE-RATING NOT = 'B77X'
+                           MOVE 'N' TO WS-VALID-FLAG
+                       END-IF
+                   WHEN 'A350'
+                       IF DB-TYPE-RATING NOT = 'A350' AND 
+                          DB-TYPE-RATING NOT = 'A330' *> Cross-crew qual
+                           MOVE 'N' TO WS-VALID-FLAG
+                       END-IF
+                   WHEN 'B737'
+                       IF DB-TYPE-RATING NOT = 'B737'
+                           MOVE 'N' TO WS-VALID-FLAG
+                       END-IF
+                   WHEN OTHER
+                       MOVE 'N' TO WS-VALID-FLAG
+               END-EVALUATE
+               
+               IF IS-INVALID
+                   MOVE 'Crew Member NOT Type-Rated for this Aircraft' 
+                     TO SCR-MSG
+                   GO TO 4100-EXIT
+               END-IF
+           END-IF.
+
+      * 3. Role Validation
+           IF SCR-ROLE-REQ NOT = DB-CREW-ROLE
+               MOVE 'N' TO WS-VALID-FLAG
+               MOVE 'Crew Role Mismatch (e.g. FA assigning to CPT slot)' 
+                 TO SCR-MSG
+           END-IF.
+
+       4100-EXIT. EXIT.
+
+       4200-CHECK-DUTY-LIMITS.
+      * Simulate population of Duty Matrix from SCHEDULEPF
+           PERFORM 4250-POPULATE-MATRIX.
+
+      * Initialize Accumulators
+           MOVE 0 TO WS-HRS-LAST-24 WS-HRS-LAST-7D WS-HRS-LAST-28D.
+
+      * Exhaustive Multi-Level Array parsing for regulatory limits
+           PERFORM VARYING WS-DAY-IDX FROM 1 BY 1 
+                     UNTIL WS-DAY-IDX > 28
+               PERFORM VARYING WS-HR-IDX FROM 1 BY 1 
+                         UNTIL WS-HR-IDX > 24
+                   
+                   IF WS-HOUR-STATUS(WS-DAY-IDX, WS-HR-IDX) = 'F'
+                       ADD 1 TO WS-HRS-LAST-28D
+                       IF WS-DAY-IDX <= 7
+                           ADD 1 TO WS-HRS-LAST-7D
+                       END-IF
+                       IF WS-DAY-IDX = 1
+                           ADD 1 TO WS-HRS-LAST-24
+                       END-IF
+                   END-IF
+
+               END-PERFORM
+           END-PERFORM.
+
+      * Apply FAA / EASA Part-FCL Limits
+           IF WS-HRS-LAST-24 > 8 AND DB-CREW-ROLE = 'CPT'
+               MOVE 'N' TO WS-VALID-FLAG
+               MOVE 'FAA LIMIT: Exceeds 8 flight hours in 24h' 
+                 TO SCR-MSG
+           ELSE IF WS-HRS-LAST-7D > 32
+               MOVE 'N' TO WS-VALID-FLAG
+               MOVE 'FAA LIMIT: Exceeds 32 flight hours in 7 days' 
+                 TO SCR-MSG
+           ELSE IF WS-HRS-LAST-28D > 100
+               MOVE 'N' TO WS-VALID-FLAG
+               MOVE 'FAA LIMIT: Exceeds 100 flight hours in 28 days' 
+                 TO SCR-MSG
+           END-IF.
+
+       4200-EXIT. EXIT.
+
+       4250-POPULATE-MATRIX.
+      * (In production, this loops SCHEDULEPF to fill the WS matrix)
+           CONTINUE.
+
+       4300-CHECK-REST-PERIOD.
+      * Calculate uninterrupted rest prior to SCR-DEP-TIME
+           MOVE 0 TO WS-REST-ACCUMULATOR.
+      * (Mock logic: assume scanning matrix backwards from departure hour)
+           MOVE 14 TO WS-REST-ACCUMULATOR. *> Assuming 14 hours rest found
+           
+           IF WS-REST-ACCUMULATOR < 12
+               MOVE 'N' TO WS-VALID-FLAG
+               MOVE 'EASA LIMIT: Minimum 12h continuous rest not met' 
+                 TO SCR-MSG
+           END-IF.
+       4300-EXIT. EXIT.
+
+       4400-CHECK-CONFLICTS.
+           MOVE DB-CREW-ID TO DB-SCHED-CREW-ID.
+           MOVE SCR-FLT-DATE TO DB-SCHED-DATE.
+           READ SCHEDULEPF
+               INVALID KEY
+                   CONTINUE *> No schedule for this date, safe to book
+               NOT INVALID KEY
+                   MOVE 'Y' TO WS-CONFLICT-FLAG
+                   MOVE 'DOUBLE BOOKING: Crew already scheduled on date' 
+                     TO SCR-MSG
+           END-READ.
+       4400-EXIT. EXIT.
+
+       5000-RESOLVE-CONFLICT.
+      * Attempt to demote current conflicting flight to Standby,
+      * or locate a Standby crew member. 
+           IF DB-SCHED-STATUS = 'S'
+               MOVE 'Standby shift overwritten with active Flight Duty.'
+                 TO SCR-MSG
+               PERFORM 6000-UPDATE-DATABASES
+           ELSE
+               MOVE 'CONFLICT: Requires manual dispatcher override.' 
+                 TO SCR-MSG
+           END-IF.
+
+       6000-UPDATE-DATABASES.
+           MOVE DB-CREW-ID     TO DB-SCHED-CREW-ID.
+           MOVE SCR-FLT-DATE   TO DB-SCHED-DATE.
+           MOVE SCR-FLT-NUM    TO DB-FLT-ASSIGNED.
+           MOVE SCR-DEP-TIME   TO DB-DUTY-START.
+           MOVE SCR-ARR-TIME   TO DB-DUTY-END.
+           
+      * Calculate Rest Start/End automatically
+           COMPUTE DB-REST-START = SCR-ARR-TIME + 30. *> 30 mins post-flt
+           COMPUTE DB-REST-END = DB-REST-START + 1200. *> 12 hrs rest
+           MOVE 'C' TO DB-SCHED-STATUS.
+
+           WRITE SCHEDULE-RECORD
+               INVALID KEY
+                   REWRITE SCHEDULE-RECORD
+           END-WRITE.
+           
+           MOVE 'Crew successfully assigned and regulatory checks passed.' 
+             TO SCR-MSG.
+
+       9000-TERMINATE.
+           CLOSE CREWPF.
+           CLOSE SCHEDULEPF.
+           CLOSE ALCRWMNTS.

@@ -1,0 +1,318 @@
+IDENTIFICATION DIVISION.
+       PROGRAM-ID. ALBILMNT.
+       AUTHOR. ENTERPRISE-IBM-I-DEVELOPER.
+       DATE-WRITTEN. JUNE 2026.
+       
+       ENVIRONMENT DIVISION.
+       CONFIGURATION SECTION.
+       SOURCE-COMPUTER. IBM-I.
+       OBJECT-COMPUTER. IBM-I.
+       
+       INPUT-OUTPUT SECTION.
+       FILE-CONTROL.
+           SELECT RESERVPF ASSIGN TO DATABASE-RESERVPF
+                  ORGANIZATION IS INDEXED
+                  ACCESS IS RANDOM
+                  RECORD KEY IS DB-RES-ID
+                  FILE STATUS IS WS-RES-STATUS.
+                  
+           SELECT BILLINGPF ASSIGN TO DATABASE-BILLINGPF
+                  ORGANIZATION IS INDEXED
+                  ACCESS IS DYNAMIC
+                  RECORD KEY IS DB-INVOICE-ID
+                  FILE STATUS IS WS-BIL-STATUS.
+
+           SELECT ALBILMNTS ASSIGN TO WORKSTATION-ALBILMNTS
+                  ORGANIZATION IS TRANSACTION
+                  ACCESS IS DYNAMIC
+                  RELATIVE KEY IS WS-SFL-RRN
+                  FILE STATUS IS WS-DSP-STATUS.
+
+       DATA DIVISION.
+       FILE SECTION.
+       FD  RESERVPF.
+       01  RESERV-RECORD.
+           05 DB-RES-ID            PIC X(10).
+           05 DB-RES-FLT-NUM       PIC X(6).
+           05 DB-PAX-NAME          PIC X(40).
+           05 DB-SEAT-CLASS        PIC X(1).
+           05 DB-BASE-PRICE        PIC 9(5)V99.
+
+       FD  BILLINGPF.
+       01  BILLING-RECORD.
+           05 DB-INVOICE-ID        PIC X(12).
+           05 DB-BIL-RES-ID        PIC X(10).
+           05 DB-CARD-NUMBER       PIC X(16).
+           05 DB-CURRENCY-CODE     PIC X(3).
+           05 DB-GROSS-AMT         PIC 9(7)V99.
+           05 DB-TAX-AMT           PIC 9(5)V99.
+           05 DB-NET-AMT           PIC 9(7)V99.
+           05 DB-PAYMENT-STATUS    PIC X(1).
+
+       FD  ALBILMNTS.
+       01  DISPLAY-RECORD          PIC X(1920).
+
+       WORKING-STORAGE SECTION.
+      *----------------------------------------------------------------*
+      * FILE STATUS & FLAGS
+      *----------------------------------------------------------------*
+       01  WS-FLAGS.
+           05 WS-RES-STATUS        PIC X(2) VALUE '00'.
+           05 WS-BIL-STATUS        PIC X(2) VALUE '00'.
+           05 WS-DSP-STATUS        PIC X(2) VALUE '00'.
+           05 WS-VALID-FLAG        PIC X(1) VALUE 'Y'.
+              88 IS-VALID                   VALUE 'Y'.
+              88 IS-INVALID                 VALUE 'N'.
+
+      *----------------------------------------------------------------*
+      * LUHN ALGORITHM (CREDIT CARD VALIDATION) VARIABLES
+      *----------------------------------------------------------------*
+       01  WS-LUHN-VARS.
+           05 WS-CC-ARRAY          PIC X(16).
+           05 WS-CC-DIGITS REDEFINES WS-CC-ARRAY.
+              10 WS-DIGIT OCCURS 16 TIMES PIC 9(1).
+           05 WS-LUHN-SUM          PIC 9(4) VALUE 0.
+           05 WS-LUHN-IDX          PIC 9(2).
+           05 WS-LUHN-TEMP         PIC 9(2).
+           05 WS-LUHN-MOD          PIC 9(2).
+           05 WS-LUHN-REM          PIC 9(2).
+
+      *----------------------------------------------------------------*
+      * MASSIVE CURRENCY EXCHANGE MATRIX (MOCK RATES VS USD)
+      *----------------------------------------------------------------*
+       01  WS-CURRENCY-DATA.
+           05 FILLER PIC X(10) VALUE 'USD1000000'.
+           05 FILLER PIC X(10) VALUE 'EUR0850000'.
+           05 FILLER PIC X(10) VALUE 'GBP0730000'.
+           05 FILLER PIC X(10) VALUE 'JPY1105000'.
+           05 FILLER PIC X(10) VALUE 'CAD1250000'.
+           05 FILLER PIC X(10) VALUE 'AUD1350000'.
+           05 FILLER PIC X(10) VALUE 'CHF0920000'.
+           05 FILLER PIC X(10) VALUE 'CNY0645000'.
+           05 FILLER PIC X(10) VALUE 'INR8250000'.
+           05 FILLER PIC X(10) VALUE 'BRL0510000'.
+           05 FILLER PIC X(10) VALUE 'ZAR1520000'.
+           05 FILLER PIC X(10) VALUE 'RUB7540000'.
+           05 FILLER PIC X(10) VALUE 'MXN2010000'.
+           05 FILLER PIC X(10) VALUE 'SGD0135000'.
+           05 FILLER PIC X(10) VALUE 'HKD0780000'.
+           05 FILLER PIC X(10) VALUE 'NZD0142000'.
+           05 FILLER PIC X(10) VALUE 'KRW1150000'.
+           05 FILLER PIC X(10) VALUE 'SEK0860000'.
+           05 FILLER PIC X(10) VALUE 'NOK0880000'.
+           05 FILLER PIC X(10) VALUE 'DKK0630000'.
+      * (Truncated for display, imagine 80 more lines here)
+           05 FILLER PIC X(800) VALUE ALL 'XXX0000000'.
+
+       01  WS-CURRENCY-TABLE REDEFINES WS-CURRENCY-DATA.
+           05 WS-CURRENCY OCCURS 100 TIMES.
+              10 WS-CURR-CODE      PIC X(3).
+              10 WS-CURR-RATE      PIC 9(3)V9(4).
+              
+       01  WS-CURR-IDX             PIC 9(3).
+       01  WS-CURR-FOUND           PIC X(1).
+
+      *----------------------------------------------------------------*
+      * CALCULATION WORK FIELDS
+      *----------------------------------------------------------------*
+       01  WS-CALC-FIELDS.
+           05 WS-CONVERTED-BASE    PIC 9(7)V99.
+           05 WS-FED-TAX           PIC 9(5)V99.
+           05 WS-SEC-TAX           PIC 9(5)V99.
+           05 WS-APT-TAX           PIC 9(5)V99.
+           05 WS-TOTAL-TAX         PIC 9(5)V99.
+           05 WS-DISCOUNT-AMT      PIC 9(5)V99.
+
+      *----------------------------------------------------------------*
+      * SCREEN FIELDS (MAPPED FROM DDS)
+      *----------------------------------------------------------------*
+       01  WS-SCREEN-DATA.
+           05 SCR-RES-ID           PIC X(10).
+           05 SCR-CC-NUM           PIC X(16).
+           05 SCR-CC-EXP-MM        PIC 9(2).
+           05 SCR-CC-EXP-YY        PIC 9(2).
+           05 SCR-BILL-CURR        PIC X(3).
+           05 SCR-FF-TIER          PIC X(1). *> B=Blue, S=Silver, G=Gold
+           05 SCR-COUNTRY-ZONE     PIC X(3). *> USA, GBR, JPN, etc.
+           05 SCR-NET-TOTAL        PIC 9(7)V99.
+           05 SCR-MSG              PIC X(60).
+
+       01  WS-INDICATORS.
+           05 IN03                 PIC 1 INDICATOR 3.
+
+       PROCEDURE DIVISION.
+       0000-MAIN-LOGIC.
+           PERFORM 1000-INITIALIZE.
+           PERFORM 2000-PROCESS-SCREEN UNTIL IN03 = B"1".
+           PERFORM 9000-TERMINATE.
+           STOP RUN.
+
+       1000-INITIALIZE.
+           OPEN INPUT RESERVPF.
+           OPEN I-O BILLINGPF.
+           OPEN I-O ALBILMNTS.
+
+       2000-PROCESS-SCREEN.
+           WRITE DISPLAY-RECORD FORMAT 'BILCTL'.
+           READ ALBILMNTS RECORD FORMAT 'BILCTL'.
+           
+           IF IN03 = B"0"
+               PERFORM 3000-PROCESS-PAYMENT
+           END-IF.
+
+       3000-PROCESS-PAYMENT.
+           MOVE SPACES TO SCR-MSG.
+           PERFORM 4000-VALIDATE-INPUTS.
+           
+           IF IS-VALID
+               PERFORM 5000-FETCH-RESERVATION
+               IF IS-VALID
+                   PERFORM 6000-CALCULATE-FINANCIALS
+                   PERFORM 7000-WRITE-INVOICE
+               END-IF
+           END-IF.
+
+       4000-VALIDATE-INPUTS.
+           MOVE 'Y' TO WS-VALID-FLAG.
+
+      * 1. Explicit Luhn Algorithm Check
+           IF SCR-CC-NUM NOT IS NUMERIC
+               MOVE 'N' TO WS-VALID-FLAG
+               MOVE 'Credit Card must be numeric' TO SCR-MSG
+               GO TO 4000-EXIT
+           END-IF.
+
+           MOVE SCR-CC-NUM TO WS-CC-ARRAY.
+           MOVE 0 TO WS-LUHN-SUM.
+
+           PERFORM VARYING WS-LUHN-IDX FROM 16 BY -1 
+                     UNTIL WS-LUHN-IDX < 1
+               MOVE WS-DIGIT(WS-LUHN-IDX) TO WS-LUHN-TEMP
+               
+               COMPUTE WS-LUHN-MOD = FUNCTION MOD(WS-LUHN-IDX, 2)
+               
+               IF WS-LUHN-MOD = 0 *> Every second digit from right
+                   MULTIPLY 2 BY WS-LUHN-TEMP
+                   IF WS-LUHN-TEMP > 9
+                       SUBTRACT 9 FROM WS-LUHN-TEMP
+                   END-IF
+               END-IF
+               
+               ADD WS-LUHN-TEMP TO WS-LUHN-SUM
+           END-PERFORM.
+
+           DIVIDE WS-LUHN-SUM BY 10 GIVING WS-LUHN-TEMP 
+                                    REMAINDER WS-LUHN-REM.
+                                    
+           IF WS-LUHN-REM NOT = 0
+               MOVE 'N' TO WS-VALID-FLAG
+               MOVE 'Credit Card failed Luhn Validation' TO SCR-MSG
+               GO TO 4000-EXIT
+           END-IF.
+
+      * 2. Currency Validation
+           MOVE 'N' TO WS-CURR-FOUND.
+           PERFORM VARYING WS-CURR-IDX FROM 1 BY 1 
+                     UNTIL WS-CURR-IDX > 100 OR WS-CURR-FOUND = 'Y'
+               IF SCR-BILL-CURR = WS-CURR-CODE(WS-CURR-IDX)
+                   MOVE 'Y' TO WS-CURR-FOUND
+               END-IF
+           END-PERFORM.
+
+           IF WS-CURR-FOUND = 'N'
+               MOVE 'N' TO WS-VALID-FLAG
+               MOVE 'Unsupported Billing Currency' TO SCR-MSG
+           END-IF.
+
+       4000-EXIT. EXIT.
+
+       5000-FETCH-RESERVATION.
+           MOVE SCR-RES-ID TO DB-RES-ID.
+           READ RESERVPF
+               INVALID KEY
+                   MOVE 'N' TO WS-VALID-FLAG
+                   MOVE 'Reservation ID not found' TO SCR-MSG
+           END-READ.
+
+       6000-CALCULATE-FINANCIALS.
+      * Step 1: Currency Conversion
+           COMPUTE WS-CONVERTED-BASE = 
+               DB-BASE-PRICE * WS-CURR-RATE(WS-CURR-IDX).
+
+      * Step 2: Exhaustive Tax Zone Evaluation
+           MOVE 0 TO WS-FED-TAX WS-SEC-TAX WS-APT-TAX.
+
+           EVALUATE SCR-COUNTRY-ZONE
+               WHEN 'USA'
+                   COMPUTE WS-FED-TAX = WS-CONVERTED-BASE * 0.075
+                   MOVE 5.60 TO WS-SEC-TAX
+                   MOVE 4.50 TO WS-APT-TAX
+               WHEN 'GBR'
+                   COMPUTE WS-FED-TAX = WS-CONVERTED-BASE * 0.20
+                   MOVE 10.00 TO WS-SEC-TAX
+                   MOVE 15.00 TO WS-APT-TAX
+               WHEN 'JPN'
+                   COMPUTE WS-FED-TAX = WS-CONVERTED-BASE * 0.10
+                   MOVE 2.50 TO WS-SEC-TAX
+                   MOVE 8.00 TO WS-APT-TAX
+               WHEN 'CAN'
+                   COMPUTE WS-FED-TAX = WS-CONVERTED-BASE * 0.05
+                   MOVE 7.12 TO WS-SEC-TAX
+                   MOVE 12.00 TO WS-APT-TAX
+               WHEN 'AUS'
+                   COMPUTE WS-FED-TAX = WS-CONVERTED-BASE * 0.10
+                   MOVE 6.00 TO WS-SEC-TAX
+                   MOVE 9.50 TO WS-APT-TAX
+               WHEN OTHER
+                   COMPUTE WS-FED-TAX = WS-CONVERTED-BASE * 0.05
+                   MOVE 5.00 TO WS-SEC-TAX
+                   MOVE 5.00 TO WS-APT-TAX
+           END-EVALUATE.
+
+           COMPUTE WS-TOTAL-TAX = WS-FED-TAX + WS-SEC-TAX + WS-APT-TAX.
+
+      * Step 3: Frequent Flyer Tier Discounts
+           MOVE 0 TO WS-DISCOUNT-AMT.
+           EVALUATE SCR-FF-TIER
+               WHEN 'D' *> Diamond
+                   COMPUTE WS-DISCOUNT-AMT = WS-CONVERTED-BASE * 0.20
+               WHEN 'P' *> Platinum
+                   COMPUTE WS-DISCOUNT-AMT = WS-CONVERTED-BASE * 0.15
+               WHEN 'G' *> Gold
+                   COMPUTE WS-DISCOUNT-AMT = WS-CONVERTED-BASE * 0.10
+               WHEN 'S' *> Silver
+                   COMPUTE WS-DISCOUNT-AMT = WS-CONVERTED-BASE * 0.05
+               WHEN OTHER *> Blue or None
+                   MOVE 0 TO WS-DISCOUNT-AMT
+           END-EVALUATE.
+
+      * Step 4: Final Net Calculation
+           COMPUTE SCR-NET-TOTAL = 
+               (WS-CONVERTED-BASE + WS-TOTAL-TAX) - WS-DISCOUNT-AMT.
+
+       7000-WRITE-INVOICE.
+      * Generate mock Invoice ID
+           STRING 'INV-' DELIMITED BY SIZE
+                  SCR-RES-ID(1:6) DELIMITED BY SIZE
+                  SCR-CC-NUM(13:4) DELIMITED BY SIZE
+             INTO DB-INVOICE-ID.
+
+           MOVE SCR-RES-ID       TO DB-BIL-RES-ID.
+           MOVE SCR-CC-NUM       TO DB-CARD-NUMBER.
+           MOVE SCR-BILL-CURR    TO DB-CURRENCY-CODE.
+           MOVE WS-CONVERTED-BASE TO DB-GROSS-AMT.
+           MOVE WS-TOTAL-TAX     TO DB-TAX-AMT.
+           MOVE SCR-NET-TOTAL    TO DB-NET-AMT.
+           MOVE 'A'              TO DB-PAYMENT-STATUS. *> A = Approved
+
+           WRITE BILLING-RECORD
+               INVALID KEY
+                   MOVE 'Invoice Creation Failed - Dup Key' TO SCR-MSG
+               NOT INVALID KEY
+                   MOVE 'Payment Processed Successfully.' TO SCR-MSG
+           END-WRITE.
+
+       9000-TERMINATE.
+           CLOSE RESERVPF.
+           CLOSE BILLINGPF.
+           CLOSE ALBILMNTS.

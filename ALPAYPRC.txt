@@ -1,0 +1,428 @@
+*****************************************************************
+      * PROGRAM-ID:  ALPAYPRC                                         *
+      * AUTHOR:      IBM i Financial COBOL Developer                  *
+      * DESCRIPTION: Enterprise Ticket Payment & Ledger Processing    *
+      * FEATURES:    - Granular Native Luhn CC Validation             *
+      * - Multi-Currency Exchange Matrix with Bid/Ask      *
+      * - Multi-Tiered Regional Tax & Surcharge Engine     *
+      * - Detailed Financial Ledger & Error Journaling     *
+      *****************************************************************
+       IDENTIFICATION DIVISION.
+       PROGRAM-ID. ALPAYPRC.
+
+       ENVIRONMENT DIVISION.
+       INPUT-OUTPUT SECTION.
+       FILE-CONTROL.
+           SELECT LEDGER-FILE ASSIGN TO DATABASE-FINLEDG
+               ORGANIZATION IS SEQUENTIAL
+               ACCESS MODE IS SEQUENTIAL
+               FILE STATUS IS WS-LEDGER-STATUS.
+
+           SELECT AUDIT-FILE ASSIGN TO DATABASE-FINAUDIT
+               ORGANIZATION IS SEQUENTIAL
+               ACCESS MODE IS SEQUENTIAL
+               FILE STATUS IS WS-AUDIT-STATUS.
+
+           SELECT ERROR-LOG ASSIGN TO PRINTER-QPRINT
+               ORGANIZATION IS SEQUENTIAL.
+
+       DATA DIVISION.
+       FILE SECTION.
+       FD  LEDGER-FILE.
+       01  LEDGER-RECORD.
+           05  LED-TIMESTAMP            PIC X(20).
+           05  LED-TRANS-ID             PIC X(15).
+           05  LED-TICKET-NO            PIC X(15).
+           05  LED-TRANS-TYPE           PIC X(01).
+           05  LED-CURRENCY-USED        PIC X(03).
+           05  LED-EXCHANGE-RATE        PIC 9(03)V9(04).
+           05  LED-BASE-AMT             PIC 9(09)V99.
+           05  LED-FUEL-SUR             PIC 9(07)V99.
+           05  LED-NAT-TAX-AMT          PIC 9(07)V99.
+           05  LED-REG-TAX-AMT          PIC 9(07)V99.
+           05  LED-SEC-FEE              PIC 9(07)V99.
+           05  LED-GW-FEE               PIC 9(07)V99.
+           05  LED-TOTAL-AMT            PIC 9(11)V99.
+           05  LED-CARD-LAST4           PIC X(04).
+
+       FD  AUDIT-FILE.
+       01  AUDIT-RECORD.
+           05  AUD-TIMESTAMP            PIC X(20).
+           05  AUD-PROGRAM              PIC X(10).
+           05  AUD-TRANS-ID             PIC X(15).
+           05  AUD-STATUS-CODE          PIC X(02).
+           05  AUD-STATUS-DESC          PIC X(50).
+
+       FD  ERROR-LOG.
+       01  ERR-PRINT-LINE               PIC X(132).
+
+       WORKING-STORAGE SECTION.
+      * ---------------------------------------------------------------
+      * COPYBOOKS (Simulated standard enterprise copybooks)
+      * COPY QSYSINC/QCBLLESRC,CEEAPI.
+      * ---------------------------------------------------------------
+       01  WS-FILE-STATUS-AREA.
+           05  WS-LEDGER-STATUS         PIC X(02) VALUE '00'.
+               88 LEDGER-OK             VALUE '00'.
+           05  WS-AUDIT-STATUS          PIC X(02) VALUE '00'.
+               88 AUDIT-OK              VALUE '00'.
+
+       01  WS-SYSTEM-TIME-AREA.
+           05  WS-LILIAN-DAYS           PIC S9(09) BINARY.
+           05  WS-LILIAN-SECS           PIC COMP-8.
+           05  WS-GREGORIAN-DATE        PIC X(20).
+           05  WS-PIC-STR               PIC X(20) 
+                                        VALUE 'YYYY-MM-DD HH:MI:SS '.
+           05  WS-FC                    PIC X(12).
+
+       01  WS-LUHN-WORK-AREA.
+           05  WS-CC-LENGTH             PIC 9(02) COMP.
+           05  WS-LUHN-SUM              PIC 9(04) COMP VALUE 0.
+           05  WS-LUHN-IDX              PIC 9(02) COMP.
+           05  WS-LUHN-DIGIT            PIC 9(01) COMP.
+           05  WS-LUHN-DBL              PIC 9(02) COMP.
+           05  WS-REMAINDER             PIC 9(02) COMP.
+           05  WS-IS-SECOND             PIC X(01) VALUE 'N'.
+           05  WS-CC-ARRAY.
+               10 WS-CC-CHAR            PIC X(01) OCCURS 16 TIMES 
+                                        INDEXED BY CC-IDX.
+           05  WS-CC-VALID-FLAG         PIC X(01) VALUE 'Y'.
+
+       01  WS-CURRENCY-WORK-AREA.
+           05  WS-RATE-FOUND            PIC X(01) VALUE 'N'.
+           05  WS-SELECTED-RATE         PIC 9(03)V9(04) COMP-3 VALUE 0.
+           05  WS-CUR-RECORD OCCURS 12 TIMES INDEXED BY CUR-IDX.
+               10  WS-CUR-CODE          PIC X(03).
+               10  WS-CUR-RATE          PIC 9(03)V9(04).
+               10  WS-CUR-SPREAD        PIC 9(01)V9(04).
+
+       01  WS-TAX-COMPUTATION-AREA.
+           05  WS-CONV-BASE-AMT         PIC 9(09)V9999 COMP-3 VALUE 0.
+           05  WS-CALC-NAT-TAX          PIC 9(07)V9999 COMP-3 VALUE 0.
+           05  WS-CALC-REG-TAX          PIC 9(07)V9999 COMP-3 VALUE 0.
+           05  WS-CALC-SEC-FEE          PIC 9(07)V9999 COMP-3 VALUE 0.
+           05  WS-CALC-FUEL-SUR         PIC 9(07)V9999 COMP-3 VALUE 0.
+           05  WS-CALC-GW-FEE           PIC 9(07)V9999 COMP-3 VALUE 0.
+           05  WS-TEMP-TAXABLE-BASE     PIC 9(09)V9999 COMP-3 VALUE 0.
+           05  WS-GRAND-TOTAL           PIC 9(11)V99   COMP-3 VALUE 0.
+           05  WS-VAT-RATE              PIC 9(02)V9999 COMP-3 VALUE 0.
+           05  WS-REGIONAL-RATE         PIC 9(02)V9999 COMP-3 VALUE 0.
+
+       01  WS-ERROR-FORMAT-AREA.
+           05  WS-ERR-HEADER            PIC X(132) 
+               VALUE '*** ALPAYPRC CRITICAL ABEND REPORT ***'.
+           05  WS-ERR-DETAIL.
+               10  FILLER               PIC X(12) VALUE 'TRANS ID:   '.
+               10  WS-ERR-TRANS         PIC X(15).
+               10  FILLER               PIC X(12) VALUE '  STATUS:   '.
+               10  WS-ERR-STAT          PIC X(02).
+               10  FILLER               PIC X(12) VALUE '  MESSAGE:  '.
+               10  WS-ERR-MSG           PIC X(50).
+
+       LINKAGE SECTION.
+       01  LS-PAYMENT-REQUEST.
+           05  LS-TRANS-ID              PIC X(15).
+           05  LS-TICKET-NO             PIC X(15).
+           05  LS-TRANS-TYPE            PIC X(01). 
+           05  LS-CC-NUMBER             PIC X(16).
+           05  LS-BASE-AMT              PIC 9(07)V99.
+           05  LS-CURRENCY              PIC X(03).
+           05  LS-COUNTRY-ORG           PIC X(02). 
+           05  LS-STATE-ORG             PIC X(02).
+           05  LS-APT-ORG               PIC X(03).
+           05  LS-FLT-DISTANCE          PIC 9(05).
+
+       01  LS-PAYMENT-RESPONSE.
+           05  LS-RETURN-CODE           PIC X(02).
+           05  LS-RETURN-MSG            PIC X(50).
+           05  LS-CHARGED-AMT           PIC 9(09)V99.
+
+      * ===============================================================
+       PROCEDURE DIVISION USING LS-PAYMENT-REQUEST 
+                                LS-PAYMENT-RESPONSE.
+      * ===============================================================
+       DECLARATIVES.
+       GLOBAL-ERROR-HANDLER SECTION.
+           USE AFTER STANDARD ERROR PROCEDURE ON LEDGER-FILE, 
+                                                 AUDIT-FILE.
+       GLOBAL-ERROR-LOGIC.
+           MOVE '99' TO LS-RETURN-CODE.
+           STRING 'SYSTEM I/O ABEND. LEDGER: ' WS-LEDGER-STATUS 
+                  ' AUDIT: ' WS-AUDIT-STATUS 
+                  DELIMITED BY SIZE INTO LS-RETURN-MSG.
+           PERFORM 9999-DUMP-ERROR-LOG.
+       END DECLARATIVES.
+
+      * ===============================================================
+       0000-MAIN-PROCESSING-DRIVER.
+      * ===============================================================
+           PERFORM 1000-INITIALIZATION.
+           
+           PERFORM 2000-VALIDATE-CREDIT-CARD.
+           
+           IF WS-CC-VALID-FLAG = 'Y'
+               PERFORM 3000-DETERMINE-EXCHANGE-RATE
+               PERFORM 4000-CALCULATE-BASE-CONVERSION
+               PERFORM 5000-CALCULATE-FUEL-SURCHARGE
+               PERFORM 6000-GLOBAL-TAX-ROUTINE
+               PERFORM 7000-CALCULATE-GATEWAY-FEES
+               PERFORM 8000-COMPUTE-FINAL-TOTALS
+               PERFORM 9000-POST-FINANCIAL-LEDGER
+           END-IF.
+
+           PERFORM 9500-WRITE-AUDIT-TRAIL.
+           PERFORM 9900-CLEANUP-AND-EXIT.
+
+      * ===============================================================
+       1000-INITIALIZATION.
+      * ===============================================================
+           INITIALIZE LS-PAYMENT-RESPONSE
+           INITIALIZE WS-TAX-COMPUTATION-AREA
+           INITIALIZE WS-LUHN-WORK-AREA
+           
+           MOVE '00' TO LS-RETURN-CODE
+           MOVE 'Y'  TO WS-CC-VALID-FLAG
+           
+           OPEN EXTEND LEDGER-FILE
+           OPEN EXTEND AUDIT-FILE.
+
+      * Populate Static Matrix (Usually done via DB read, hardcoded 
+      * here for simulation verbosity)
+           MOVE 'USD001.00000.0000' TO WS-CUR-RECORD(1)
+           MOVE 'EUR000.92500.0150' TO WS-CUR-RECORD(2)
+           MOVE 'GBP000.79100.0200' TO WS-CUR-RECORD(3)
+           MOVE 'JPY150.45000.5000' TO WS-CUR-RECORD(4)
+           MOVE 'CAD001.35000.0120' TO WS-CUR-RECORD(5)
+           MOVE 'AUD001.52000.0150' TO WS-CUR-RECORD(6)
+           MOVE 'INR083.20000.2500' TO WS-CUR-RECORD(7)
+           MOVE 'CHF000.88000.0100' TO WS-CUR-RECORD(8)
+           MOVE 'SGD001.34000.0110' TO WS-CUR-RECORD(9)
+           MOVE 'HKD007.82000.0050' TO WS-CUR-RECORD(10)
+           MOVE 'NZD001.65000.0180' TO WS-CUR-RECORD(11)
+           MOVE 'ZAR018.90000.3000' TO WS-CUR-RECORD(12).
+
+           CALL 'CEELOCT' USING WS-LILIAN-DAYS, WS-LILIAN-SECS, 
+                                WS-GREGORIAN-DATE, WS-FC.
+           CALL 'CEEDATM' USING WS-LILIAN-SECS, WS-PIC-STR, 
+                                WS-GREGORIAN-DATE, WS-FC.
+
+      * ===============================================================
+       2000-VALIDATE-CREDIT-CARD.
+      * Verbose Right-to-Left Luhn Algorithm implementation
+      * ===============================================================
+           MOVE LS-CC-NUMBER TO WS-CC-ARRAY.
+           MOVE 0 TO WS-LUHN-SUM.
+           MOVE 'N' TO WS-IS-SECOND.
+           
+           PERFORM VARYING WS-LUHN-IDX FROM 16 BY -1 
+                     UNTIL WS-LUHN-IDX < 1
+               
+               MOVE WS-CC-CHAR(WS-LUHN-IDX) TO WS-LUHN-DIGIT
+               
+               IF WS-IS-SECOND = 'Y'
+                   MULTIPLY WS-LUHN-DIGIT BY 2 GIVING WS-LUHN-DBL
+                   IF WS-LUHN-DBL > 9
+                       SUBTRACT 9 FROM WS-LUHN-DBL
+                   END-IF
+                   ADD WS-LUHN-DBL TO WS-LUHN-SUM
+                   MOVE 'N' TO WS-IS-SECOND
+               ELSE
+                   ADD WS-LUHN-DIGIT TO WS-LUHN-SUM
+                   MOVE 'Y' TO WS-IS-SECOND
+               END-IF
+           END-PERFORM.
+
+           DIVIDE WS-LUHN-SUM BY 10 GIVING WS-LUHN-IDX 
+                  REMAINDER WS-REMAINDER.
+
+           IF WS-REMAINDER NOT EQUAL TO ZERO
+               MOVE '80' TO LS-RETURN-CODE
+               MOVE 'REJECTED: LUHN CHECKSUM FAILED' TO LS-RETURN-MSG
+               MOVE 'N' TO WS-CC-VALID-FLAG
+           END-IF.
+
+      * ===============================================================
+       3000-DETERMINE-EXCHANGE-RATE.
+      * ===============================================================
+           MOVE 'N' TO WS-RATE-FOUND.
+           SET CUR-IDX TO 1.
+           
+           PERFORM VARYING CUR-IDX FROM 1 BY 1 UNTIL CUR-IDX > 12
+               IF WS-CUR-CODE(CUR-IDX) = LS-CURRENCY
+                   MOVE 'Y' TO WS-RATE-FOUND
+      * Calculate customer rate including bank spread
+                   ADD WS-CUR-RATE(CUR-IDX) TO WS-CUR-SPREAD(CUR-IDX) 
+                       GIVING WS-SELECTED-RATE
+               END-IF
+           END-PERFORM.
+
+           IF WS-RATE-FOUND = 'N'
+               MOVE '81' TO LS-RETURN-CODE
+               MOVE 'REJECTED: ISO CURRENCY NOT IN MATRIX' 
+                 TO LS-RETURN-MSG
+               MOVE 'N' TO WS-CC-VALID-FLAG
+           END-IF.
+
+      * ===============================================================
+       4000-CALCULATE-BASE-CONVERSION.
+      * ===============================================================
+           DIVIDE LS-BASE-AMT BY WS-SELECTED-RATE 
+                  GIVING WS-CONV-BASE-AMT ROUNDED.
+
+      * ===============================================================
+       5000-CALCULATE-FUEL-SURCHARGE.
+      * Multi-tier distance-based fuel logic
+      * ===============================================================
+           EVALUATE TRUE
+               WHEN LS-FLT-DISTANCE < 500
+                   MULTIPLY WS-CONV-BASE-AMT BY 0.025 
+                            GIVING WS-CALC-FUEL-SUR
+               WHEN LS-FLT-DISTANCE >= 500 AND LS-FLT-DISTANCE < 2000
+                   MULTIPLY WS-CONV-BASE-AMT BY 0.050 
+                            GIVING WS-CALC-FUEL-SUR
+               WHEN LS-FLT-DISTANCE >= 2000 AND LS-FLT-DISTANCE < 5000
+                   MULTIPLY WS-CONV-BASE-AMT BY 0.085 
+                            GIVING WS-CALC-FUEL-SUR
+               WHEN OTHER
+                   MULTIPLY WS-CONV-BASE-AMT BY 0.120 
+                            GIVING WS-CALC-FUEL-SUR
+           END-EVALUATE.
+
+      * ===============================================================
+       6000-GLOBAL-TAX-ROUTINE.
+      * ===============================================================
+           ADD WS-CONV-BASE-AMT TO WS-CALC-FUEL-SUR 
+               GIVING WS-TEMP-TAXABLE-BASE.
+
+           EVALUATE LS-COUNTRY-ORG
+               WHEN 'US'
+                   PERFORM 6100-PROCESS-US-TAXES
+               WHEN 'GB'
+                   PERFORM 6200-PROCESS-UK-TAXES
+               WHEN 'EU'
+                   PERFORM 6300-PROCESS-EU-TAXES
+               WHEN OTHER
+                   PERFORM 6900-PROCESS-DEFAULT-TAXES
+           END-EVALUATE.
+
+       6100-PROCESS-US-TAXES.
+           MOVE 0.075 TO WS-VAT-RATE.
+           MULTIPLY WS-TEMP-TAXABLE-BASE BY WS-VAT-RATE 
+                    GIVING WS-CALC-NAT-TAX ROUNDED.
+
+      * US State-level regional tax application
+           IF LS-STATE-ORG = 'NY' OR LS-STATE-ORG = 'CA'
+               MOVE 0.04 TO WS-REGIONAL-RATE
+               MULTIPLY WS-TEMP-TAXABLE-BASE BY WS-REGIONAL-RATE 
+                        GIVING WS-CALC-REG-TAX ROUNDED
+           ELSE
+               MOVE 0.00 TO WS-CALC-REG-TAX
+           END-IF.
+           
+           MOVE 11.20 TO WS-CALC-SEC-FEE.  *> Sept 11th Security Fee
+
+       6200-PROCESS-UK-TAXES.
+           MOVE 0.200 TO WS-VAT-RATE.
+           MULTIPLY WS-TEMP-TAXABLE-BASE BY WS-VAT-RATE 
+                    GIVING WS-CALC-NAT-TAX ROUNDED.
+           
+      * UK Air Passenger Duty (APD)
+           IF LS-FLT-DISTANCE > 2000
+               MOVE 185.00 TO WS-CALC-REG-TAX
+           ELSE
+               MOVE 13.00 TO WS-CALC-REG-TAX
+           END-IF.
+           MOVE 25.00 TO WS-CALC-SEC-FEE.
+
+       6300-PROCESS-EU-TAXES.
+           MOVE 0.190 TO WS-VAT-RATE.
+           MULTIPLY WS-TEMP-TAXABLE-BASE BY WS-VAT-RATE 
+                    GIVING WS-CALC-NAT-TAX ROUNDED.
+           MOVE 45.00 TO WS-CALC-REG-TAX.  *> General EU Departure
+           MOVE 18.50 TO WS-CALC-SEC-FEE.
+
+       6900-PROCESS-DEFAULT-TAXES.
+           MOVE 0.050 TO WS-VAT-RATE.
+           MULTIPLY WS-TEMP-TAXABLE-BASE BY WS-VAT-RATE 
+                    GIVING WS-CALC-NAT-TAX ROUNDED.
+           MOVE 10.00 TO WS-CALC-REG-TAX.
+           MOVE 15.00 TO WS-CALC-SEC-FEE.
+
+      * ===============================================================
+       7000-CALCULATE-GATEWAY-FEES.
+      * Payment processor interchange fee (e.g., Visa/Mastercard 2.9%)
+      * ===============================================================
+           COMPUTE WS-CALC-GW-FEE ROUNDED = 
+             (WS-CONV-BASE-AMT + WS-CALC-NAT-TAX + WS-CALC-REG-TAX) 
+             * 0.029.
+
+      * ===============================================================
+       8000-COMPUTE-FINAL-TOTALS.
+      * ===============================================================
+           ADD WS-CONV-BASE-AMT 
+               WS-CALC-FUEL-SUR
+               WS-CALC-NAT-TAX
+               WS-CALC-REG-TAX
+               WS-CALC-SEC-FEE
+               WS-CALC-GW-FEE
+               GIVING WS-GRAND-TOTAL.
+
+      * Convert final settled amount back to customer's requested 
+      * currency for billing response.
+           MULTIPLY WS-GRAND-TOTAL BY WS-SELECTED-RATE 
+                    GIVING LS-CHARGED-AMT ROUNDED.
+
+      * ===============================================================
+       9000-POST-FINANCIAL-LEDGER.
+      * ===============================================================
+           INITIALIZE LEDGER-RECORD.
+           MOVE WS-GREGORIAN-DATE       TO LED-TIMESTAMP.
+           MOVE LS-TRANS-ID             TO LED-TRANS-ID.
+           MOVE LS-TICKET-NO            TO LED-TICKET-NO.
+           MOVE LS-TRANS-TYPE           TO LED-TRANS-TYPE.
+           MOVE LS-CURRENCY             TO LED-CURRENCY-USED.
+           MOVE WS-SELECTED-RATE        TO LED-EXCHANGE-RATE.
+           MOVE WS-CONV-BASE-AMT        TO LED-BASE-AMT.
+           MOVE WS-CALC-FUEL-SUR        TO LED-FUEL-SUR.
+           MOVE WS-CALC-NAT-TAX         TO LED-NAT-TAX-AMT.
+           MOVE WS-CALC-REG-TAX         TO LED-REG-TAX-AMT.
+           MOVE WS-CALC-SEC-FEE         TO LED-SEC-FEE.
+           MOVE WS-CALC-GW-FEE          TO LED-GW-FEE.
+           MOVE WS-GRAND-TOTAL          TO LED-TOTAL-AMT.
+           MOVE LS-CC-NUMBER(13:4)      TO LED-CARD-LAST4.
+
+           WRITE LEDGER-RECORD.
+           
+           MOVE 'SUCCESS: PAYMENT AUTHORIZED AND JOURNALED' 
+             TO LS-RETURN-MSG.
+
+      * ===============================================================
+       9500-WRITE-AUDIT-TRAIL.
+      * Always write to audit, regardless of success or failure.
+      * ===============================================================
+           INITIALIZE AUDIT-RECORD.
+           MOVE WS-GREGORIAN-DATE TO AUD-TIMESTAMP.
+           MOVE 'ALPAYPRC'        TO AUD-PROGRAM.
+           MOVE LS-TRANS-ID       TO AUD-TRANS-ID.
+           MOVE LS-RETURN-CODE    TO AUD-STATUS-CODE.
+           MOVE LS-RETURN-MSG     TO AUD-STATUS-DESC.
+           WRITE AUDIT-RECORD.
+
+      * ===============================================================
+       9900-CLEANUP-AND-EXIT.
+      * ===============================================================
+           CLOSE LEDGER-FILE.
+           CLOSE AUDIT-FILE.
+           GOBACK.
+
+      * ===============================================================
+       9999-DUMP-ERROR-LOG.
+      * ===============================================================
+           OPEN OUTPUT ERROR-LOG.
+           WRITE ERR-PRINT-LINE FROM WS-ERR-HEADER.
+           MOVE LS-TRANS-ID TO WS-ERR-TRANS.
+           MOVE LS-RETURN-CODE TO WS-ERR-STAT.
+           MOVE LS-RETURN-MSG TO WS-ERR-MSG.
+           WRITE ERR-PRINT-LINE FROM WS-ERR-DETAIL.
+           CLOSE ERROR-LOG.
+           GOBACK.
